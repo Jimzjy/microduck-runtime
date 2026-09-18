@@ -40,6 +40,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::{Parser, Subcommand};
+use duck_control::bus_feetech::FeetechConfig;
+use duck_control::bus_select::BusProtocol;
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
@@ -1275,6 +1277,15 @@ fn spawn_control_thread(
             // because nothing had been *attempted* the health reason was the bland "control
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
+            // Refused here rather than retried: a direction list of the wrong length does not
+            // fix itself, and waiting on it would read as "servo power is off".
+            let protocol = match bus_protocol(&params.bus) {
+                Ok(protocol) => protocol,
+                Err(e) => {
+                    tracing::error!(error = %e, "invalid [bus] parameters; no control loop");
+                    return;
+                }
+            };
             runtime.block_on(async move {
                 // The voice works while the bus does not: a robot waiting on unplugged servos
                 // still quacks. Stopped before the loop starts, which then owns the speaker.
@@ -1354,7 +1365,7 @@ impl Drop for WaitingVoice {
 
 /// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
 #[cfg(target_os = "linux")]
-type BusIo = duck_control::bus::DynamixelIo;
+type BusIo = duck_control::bus_select::AnyBus;
 #[cfg(not(target_os = "linux"))]
 type BusIo = FakeIo;
 
@@ -1436,7 +1447,18 @@ fn open_bus(
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
     let port = bus.port.as_str();
 
-    let mut io = match duck_control::bus::DynamixelIo::open(port, bus.fast_sync_read) {
+    // The protocol choice is validated before anything touches the port, so a bad
+    // `directions` length is a config error, not a mysterious bus failure.
+    let protocol = match bus_protocol(bus) {
+        Ok(protocol) => protocol,
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, port, "invalid [bus] parameters; waiting");
+            }
+            return None;
+        }
+    };
+    let mut io = match BusIo::open(port, &protocol) {
         Ok(io) => io,
         Err(e) => {
             if loud {
@@ -1445,20 +1467,31 @@ fn open_bus(
             return None;
         }
     };
-    io.set_imu_mount(body_imu_mount(board));
-    // Under the same `loud` rule as everything else here — a board waiting on servo power
-    // retries this forever. Worth saying at all because the whole tick budget hangs off it,
-    // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
-    if !bus.fast_sync_read && loud {
-        tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
-    }
-    if !adopt_missing_servo(&mut io, loud, missing, adopted) {
-        return None;
+    // Dynamixel-only bring-up steps: the IMU mount and replacement adoption are properties of
+    // the Pollen bus. A Feetech build has no IMU on the wire (imu_ready stays false, so the
+    // policy and fall detection stay off) and its servo IDs are set by the bench rig — there
+    // is nothing to adopt and no mount to hand the decoder.
+    if matches!(protocol, BusProtocol::Dynamixel2) {
+        io.set_imu_mount(body_imu_mount(board));
+        // Under the same `loud` rule as everything else here — a board waiting on servo power
+        // retries this forever. Worth saying at all because the whole tick budget hangs off it,
+        // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
+        if !bus.fast_sync_read && loud {
+            tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
+        }
+        if !adopt_missing_servo(&mut io, loud, missing, adopted) {
+            return None;
+        }
     }
     match io.check_registers() {
-        // Gated too: a board waiting on its IMU board gets this far every attempt.
-        Ok(0) if loud => tracing::info!("motor registers already correct"),
-        Ok(0) => {}
+        Ok(0) => {
+            if loud {
+                tracing::info!(
+                    protocol = io.protocol_name(),
+                    "motor registers already correct"
+                );
+            }
+        }
         Ok(n) => tracing::warn!(corrected = n, "motor registers corrected"),
         Err(e) => {
             if loud {
@@ -1510,6 +1543,20 @@ fn imu_answers(io: &mut BusIo, attempt: u32) -> Option<bool> {
 #[cfg(not(target_os = "linux"))]
 fn imu_answers(_io: &mut BusIo, _attempt: u32) -> Option<bool> {
     Some(true)
+}
+
+/// `[bus]` as the type the bus layer takes.
+///
+/// The parameter crate holds plain values and does not link the control crate, so the checks
+/// that need to know what a joint is — one direction per joint, each of them ±1 — happen here.
+fn bus_protocol(bus: &params::Bus) -> Result<BusProtocol, String> {
+    Ok(match bus.protocol {
+        params::BusProtocol::Dynamixel2 => BusProtocol::Dynamixel2,
+        params::BusProtocol::FeetechSts => BusProtocol::FeetechSts(FeetechConfig::new(
+            bus.feetech.p_scale,
+            &bus.feetech.directions,
+        )?),
+    })
 }
 
 /// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
