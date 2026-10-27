@@ -322,6 +322,10 @@ impl RobotIo for RemoteIo {
         Ok(SlowSensors {
             volts: frame.volts,
             temps_c: frame.temps_c,
+            // The remote frame carries one pack voltage, not fifteen: this backend genuinely does
+            // not know what any single servo is seeing, and zero is the value that says so rather
+            // than a made-up share of the pack.
+            joint_volts: [0.0; crate::NUM_JOINTS],
         })
     }
 }

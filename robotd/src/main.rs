@@ -19,6 +19,7 @@
 //! than hanging the caller.
 
 mod chorale;
+mod commissioning;
 mod control;
 mod head_imu;
 mod idle_head;
@@ -281,6 +282,24 @@ struct Args {
     #[arg(long)]
     busy: bool,
 
+    /// Run as the commissioning daemon rather than the motion one.
+    ///
+    /// The two are the same code with one difference that matters to a client: this one reports
+    /// `mode: "commissioning"` on `robot.busStatus`, holds poses on request through
+    /// `robot.busCommand`, and does not load a policy. A robot on the bench has to be settable
+    /// and measurable before it can be driven, and every one of those steps wants the body held
+    /// still without a gait fighting the person doing the measuring.
+    ///
+    /// The factory image ships this in a systemd drop-in and deletes the drop-in once
+    /// calibration is committed, which is why it is a flag rather than a config value: a file
+    /// whose presence is the state is one `daemon-reload` away from being the state again.
+    ///
+    /// Not refused under `--fake`: the twin is where this is exercised before a robot is powered,
+    /// and a bench mode that could not be run on the bench twin would go untested until the day it
+    /// matters. `FakeIo` answers the torso IMU and holds a pose, so the whole path runs there.
+    #[arg(long)]
+    commissioning: bool,
+
     /// Where the vet book lives — the robot's lifetime record (`vetbook.rs`). Defaults to
     /// `/var/lib/robot/vetbook.json` on a robot; under `--fake` and `--sim` the book is kept in
     /// memory unless this names a file, so a laptop running the twin writes nothing to `/var/lib`.
@@ -539,6 +558,337 @@ fn drop_unloadable_overrides_with(
     }
 }
 
+/// Where the daemon is in its life, as `robot.busStatus` spells it out.
+///
+/// Two vocabularies in one enum because the client's question is one question — "may I ask the
+/// robot to do something, and if not, why not?" — and the answer's *reason* is either a startup
+/// phase or a commissioning one. The strings are the ones the Studio already compares against;
+/// they travel on the wire, so they are not free to rename.
+///
+/// `Control` is the only steady state: the loop is running, the bus answers, and a policy is
+/// driving. Everything else is a wait, and the two worlds do not overlap — a commissioning
+/// daemon never reaches `Control`, a motion daemon never reaches the commissioning phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusPhase {
+    /// Startup: the config is being read and the bus opened.
+    ConfiguringBus,
+    /// Startup: the bus opened but something did not answer — usually servo power.
+    WaitingForBus,
+    /// Startup: the bus would not open, or its configuration is wrong. Needs a person.
+    ConfigurationError,
+    /// Commissioning: the bus answers and the robot is settled, ready for a command.
+    Ready,
+    /// Commissioning: a ramp is in progress.
+    Moving,
+    /// Commissioning: parked at the pose a previous command asked for.
+    Holding,
+    /// Commissioning: the last read failed. Torque may or may not still be on.
+    ReadError,
+    /// Commissioning: torque-off was commanded and not confirmed.
+    StopUnconfirmed,
+    /// Commissioning: powered down, or on the way.
+    PowerPending,
+    /// Motion: the loop is running under a policy.
+    Control,
+}
+
+impl BusPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ConfiguringBus => "configuring_bus",
+            Self::WaitingForBus => "waiting_for_bus",
+            Self::ConfigurationError => "configuration_error",
+            Self::Ready => "ready",
+            Self::Moving => "moving",
+            Self::Holding => "holding",
+            Self::ReadError => "read_error",
+            Self::StopUnconfirmed => "stop_unconfirmed",
+            Self::PowerPending => "power_pending",
+            Self::Control => "control",
+        }
+    }
+
+    fn of(code: u8) -> Self {
+        match code {
+            1 => Self::WaitingForBus,
+            2 => Self::ConfigurationError,
+            3 => Self::Ready,
+            4 => Self::Moving,
+            5 => Self::Holding,
+            6 => Self::ReadError,
+            7 => Self::StopUnconfirmed,
+            8 => Self::PowerPending,
+            9 => Self::Control,
+            _ => Self::ConfiguringBus,
+        }
+    }
+}
+
+/// A `robot.busCommand` handed from the IPC thread to whichever thread owns the wire.
+///
+/// The two are separated because only one of them may touch the serial port: a transaction
+/// issued from a socket handler would interleave bytes with a control tick and corrupt both.
+/// The answer comes back through the `reply` channel, so the caller waits for the move it asked
+/// for rather than for the daemon to accept the request — which is the difference between
+/// "stand still for three seconds while it happens" and "walk away and hope".
+struct BusCommandRequest {
+    command: proto::BusCommandParams,
+    reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+}
+
+/// What the calibration bench is doing to the robot right now.
+///
+/// Lives in the control loop, not in the daemon: both commands end in either a servo target or a
+/// reading of the IMU, and the loop is the only place that owns either.
+struct Bench {
+    hold: Option<commissioning::Hold>,
+    verify: Option<commissioning::Verify>,
+    /// Where the answer goes when the work finishes.
+    ///
+    /// Taken — not dropped — the moment the answer is sent, so a hold that goes on holding is not
+    /// still listening for a client that has already been answered.
+    reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>,
+}
+
+impl Bench {
+    fn answer(&mut self, result: Result<serde_json::Value, String>) {
+        if let Some(reply) = self.reply.take() {
+            // The client may have hung up; that is its business, not a failure of the move.
+            let _ = reply.send(result);
+        }
+    }
+}
+
+/// Tilt of the body away from upright, in degrees, from the gravity vector.
+fn tilt_deg_of(gravity: [f64; 3]) -> f64 {
+    (-gravity[2]).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// Which IMU the calibration file describes, as a name a page can show.
+fn imu_source_name(cal: Option<&robotd_params::calibration::Calibration>) -> String {
+    // The chip whose mount was actually verified wins; failing that, any chip the file mentions,
+    // anything rather than a made-up default that would name an IMU this robot does not have.
+    let Some(cal) = cal else {
+        return "unknown".to_owned();
+    };
+    cal.imu_mounts
+        .iter()
+        .find(|(_, mount)| mount.verified)
+        .or_else(|| cal.imu_mounts.iter().next())
+        .map(|(chip, _)| chip.clone())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Write a verified mount back to the calibration file, and to the copy this daemon is using.
+fn store_imu_mount(state: &RobotState, mount: [f64; 4]) -> Result<(), String> {
+    let mut cal = state
+        .calibration
+        .load_full()
+        .map(|cal| (*cal).clone())
+        .unwrap_or_else(robotd_params::calibration::Calibration::factory);
+    cal.set_imu_mount(mount);
+    std::fs::write(&state.calibration_path, cal.render()).map_err(|e| {
+        format!(
+            "the gesture was right, but {} could not be written: {e}. Nothing saved.",
+            state.calibration_path
+        )
+    })?;
+    state.calibration.store(Some(std::sync::Arc::new(cal)));
+    Ok(())
+}
+
+/// Pick up a `robot.busCommand` that is waiting for the wire, and start it.
+fn take_bus_command(
+    state: &RobotState,
+    sensors: Option<&duck_control::Sensors>,
+) -> Option<Bench> {
+    let request = {
+        let mut slot = state
+            .bus_command
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.take()
+    }?;
+    let mut bench = Bench {
+        hold: None,
+        verify: None,
+        reply: Some(request.reply),
+    };
+    let directions_of = |cal: Option<&robotd_params::calibration::Calibration>| {
+        cal.map(|cal| cal.directions()).unwrap_or([1.0; NUM_JOINTS])
+    };
+
+    match request.command {
+        // Answered without a bus transaction in `run_bus_command`, so it can never arrive here.
+        proto::BusCommandParams::CalibrationStatus => {
+            bench.answer(Err(
+                "calibration-status is answered from the last sample and needs no bus".to_owned(),
+            ));
+            return None;
+        }
+        proto::BusCommandParams::HoldHome {
+            directions,
+            duration_ms,
+        } => {
+            let Some(sensors) = sensors else {
+                bench.answer(Err(
+                    "the bus has not reported a position yet, so there is nothing to ramp from: \
+                     check the servos are powered and try again"
+                        .to_owned(),
+                ));
+                return None;
+            };
+            let calibration = state.calibration.load_full();
+            let robot = directions_of(calibration.as_deref());
+            // The client sends the direction table it is about to write, so the two sides can
+            // disagree out loud instead of silently inverting a leg. Only a calibrated robot has
+            // an opinion; an uncalibrated one accepts whatever the bench is holding.
+            if calibration.is_some() {
+                if directions.len() != NUM_JOINTS {
+                    bench.answer(Err(format!(
+                        "directions has {} entries, not {NUM_JOINTS}: nothing moved",
+                        directions.len()
+                    )));
+                    return None;
+                }
+                for (joint, given) in directions.iter().enumerate() {
+                    if *given != 0 && f64::from(*given) != robot[joint] {
+                        bench.answer(Err(format!(
+                            "directions disagree with the robot's calibration at joint {joint} \
+                             ({} says {given}, the robot says {:.0}): write the table the robot \
+                             has, or recalibrate. Nothing moved.",
+                            duck_control::JOINT_NAMES.get(joint).copied().unwrap_or("?"),
+                            robot[joint]
+                        )));
+                        return None;
+                    }
+                }
+            }
+            bench.hold = Some(commissioning::Hold::begin(
+                sensors.positions,
+                commissioning::hold_duration(duration_ms),
+            ));
+            state.hold_stage.store(1, Ordering::Relaxed);
+        }
+        proto::BusCommandParams::VerifyImu {
+            confirmed,
+            mount_wxyz,
+        } => {
+            if !confirmed {
+                bench.answer(Err(
+                    "the mount has to be confirmed before it is stored: nothing saved".to_owned(),
+                ));
+                return None;
+            }
+            let Some(mount) = commissioning::normalised(mount_wxyz) else {
+                bench.answer(Err(format!(
+                    "mount_wxyz {mount_wxyz:?} is not a rotation, so it cannot be stored: \
+                     nothing saved"
+                )));
+                return None;
+            };
+            bench.verify = Some(commissioning::Verify::begin(mount));
+        }
+    }
+    Some(bench)
+}
+
+/// Advance the bench by one tick, writing its target into `targets` when it has one.
+fn bench_tick(
+    bench: Option<Bench>,
+    state: &RobotState,
+    sensors: Option<&duck_control::Sensors>,
+    dt: Duration,
+    targets: &mut [f64; NUM_JOINTS],
+) -> Option<Bench> {
+    let mut bench = match bench.or_else(|| take_bus_command(state, sensors)) {
+        Some(bench) => bench,
+        None => return None,
+    };
+
+    // Relax ends a hold. On a limp robot the servos hold nothing, so a pose "still being held"
+    // would be a pose falling over — and Studio's own rule is that relax is how you get out.
+    if state.torque_state.load(Ordering::Relaxed) == 2 {
+        state.hold_stage.store(0, Ordering::Relaxed);
+        bench.answer(Err(
+            "relax was pressed while the robot was holding: nothing is holding the pose now, so \
+             it cannot be calibrated. Nothing saved."
+                .to_owned(),
+        ));
+        return None;
+    }
+
+    // The numbers are read out of the hold before its borrow ends, because answering needs the
+    // whole `Bench` — the reply channel lives beside the hold, not inside it.
+    let mut holding: Option<(bool, f64, &'static str)> = None;
+    if let Some(hold) = bench.hold.as_mut() {
+        let positions = sensors.map(|sensors| sensors.positions).unwrap_or(*targets);
+        *targets = hold.step(dt, &positions);
+        let arrived = hold.stage() == "holding";
+        state
+            .hold_stage
+            .store(if arrived { 2 } else { 1 }, Ordering::Relaxed);
+        if arrived {
+            state
+                .hold_error_deg
+                .store(hold.max_error_deg().to_bits(), Ordering::Relaxed);
+        }
+        holding = Some((hold.settled(), hold.max_error_deg(), hold.stage()));
+    }
+    if let Some((settled, error, stage)) = holding {
+        if settled && bench.reply.is_some() {
+            if error > commissioning::HOLD_ERROR_TOLERANCE_DEG {
+                // Not a hold worth calibrating on, and continuing to push a joint that cannot
+                // get there is how a servo gets hot. Give the pose up and say why.
+                state.hold_stage.store(0, Ordering::Relaxed);
+                bench.answer(Err(format!(
+                    "the joints are still {error:.1}° from home, past the {:.0}° a calibration \
+                     can be taken on: check for a blocked joint, then relax the robot and try \
+                     again. Nothing saved.",
+                    commissioning::HOLD_ERROR_TOLERANCE_DEG
+                )));
+                return None;
+            }
+            bench.answer(Ok(serde_json::json!({
+                "stage": stage,
+                "max_error_deg": error,
+            })));
+        }
+        return Some(bench);
+    }
+
+    if let Some(verify) = bench.verify.as_mut() {
+        let Some(sensors) = sensors else {
+            bench.answer(Err(
+                "verify-imu needs a live IMU sample and the bus has not produced one: check the \
+                 IMU board on the bus and try again. Nothing saved."
+                    .to_owned(),
+            ));
+            return None;
+        };
+        let tilt = tilt_deg_of(sensors.imu.gravity);
+        match verify.step(dt, tilt, sensors.imu.gravity) {
+            commissioning::VerifyStep::Waiting => {}
+            commissioning::VerifyStep::Failed(text) => {
+                bench.answer(Err(text));
+                return None;
+            }
+            commissioning::VerifyStep::Done(mount) => {
+                let result = store_imu_mount(state, mount);
+                bench.answer(result.map(|()| {
+                    serde_json::json!({
+                        "imu_mount": { "quat": mount, "verified": true },
+                    })
+                }));
+                return None;
+            }
+        }
+        return Some(bench);
+    }
+
+    None
+}
+
 struct RobotState {
     /// Epoch for every timestamp below. `Instant` so the clock cannot go backwards.
     started: Instant,
@@ -589,6 +939,65 @@ struct RobotState {
     /// run is still growing whenever the next sample lands.
     imu_stale_run: AtomicU64,
     imu_ready: AtomicBool,
+    /// The calibration this robot was opened against, if `[bus.feetech] calibration` named a
+    /// file that parsed. Swapped rather than fixed because `robot.busCommand verify-imu`
+    /// rewrites one field of it, and the page asks for the result immediately afterwards.
+    calibration: ArcSwapOption<robotd_params::calibration::Calibration>,
+    /// What the servos said on the last tick: positions, currents, the IMU sample. The token
+    /// detail `robot.busStatus` reports, kept here rather than read from the loop's io, which
+    /// the IPC side does not have and must not touch.
+    bus_sample: ArcSwapOption<proto::BusSample>,
+    /// The slow sensors (per-joint volts and temperatures) from the last second's sample,
+    /// which is where they come from — see [`sample_thermal`].
+    slow: ArcSwapOption<duck_control::io::SlowSensors>,
+    /// Where the daemon is in its life, as a [`proto::BusStatus`] phase.
+    bus_phase: AtomicU8,
+    /// Which wire the servos speak, once the config has been read — `feetech-sts` or
+    /// `dynamixel2`. Kept here because `robot.busStatus` is answered off the control thread and
+    /// the loop's io handle is not reachable from it.
+    bus_backend_name: ArcSwapOption<String>,
+    /// This daemon is running commissioning rather than motion — `--commissioning`, which the
+    /// factory drop-in passes. Set once at startup, before the socket is served; read by every
+    /// `robot.busStatus`.
+    commissioning: AtomicBool,
+    /// Torque as the servos last confirmed it: 0 unknown, 1 on, 2 off.
+    ///
+    /// Three states rather than a flag, because `robot.busStatus` has to distinguish "off" from
+    /// "not asked yet" — an emergency stop that reads an unasked bus as "limp" is worse than one
+    /// that says it does not know.
+    torque_state: AtomicU8,
+    /// Somebody asked for torque off and it has not landed yet.
+    torque_off_pending: AtomicBool,
+    /// Reads that missed at least one servo, cumulative.
+    missing_total: AtomicU64,
+    /// Commands clamped to a joint's measured travel, cumulative.
+    command_clamps_total: AtomicU64,
+    /// Joint IDs that did not answer the last read.
+    stale_joint_ids: ArcSwap<Vec<u8>>,
+    /// Counts up on every published sample, so a client can tell a fresh answer from a repeat.
+    sample_revision: AtomicU64,
+    /// 0 = no hold, 1 = ramping to the home pose, 2 = holding it.
+    ///
+    /// A phase rather than a field on the request, because the hold outlives the answer: the
+    /// bench asks once, is told the pose has arrived, and then keeps polling while it takes its
+    /// calibration from a robot that must not move.
+    hold_stage: AtomicU8,
+    /// Worst joint error of the current hold since its ramp finished, in degrees, as
+    /// `f64::to_bits` — the number that decides whether a pose is steady enough to calibrate on.
+    hold_error_deg: AtomicU64,
+    /// Where the calibration file lives, whether or not it loaded.
+    ///
+    /// A fixed path rather than the loaded document's, because the two cases both need it: a
+    /// `verify-imu` writes here (creating the file on a robot that never had one), and
+    /// `calibration-status` names it so a page can say which path is missing.
+    calibration_path: String,
+    /// A `robot.busCommand` waiting for the thread that owns the wire.
+    ///
+    /// The bus belongs to the control thread — a transaction issued from the IPC side would
+    /// interleave bytes with a tick and corrupt both — so a command that needs the servos is
+    /// handed over here and answered by whoever has them. One slot only: two callers driving
+    /// fifteen servos at once is the one thing that must not happen.
+    bus_command: std::sync::Mutex<Option<BusCommandRequest>>,
     shutdown: AtomicBool,
     /// What `robot.flashlight` last asked for, as [`leds::Flashlight`] stores it.
     flashlight: AtomicU8,
@@ -746,6 +1155,31 @@ impl RobotState {
             imu_stale_blocks: AtomicU64::new(0),
             imu_stale_run: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
+            // Empty until the bus is opened: a test robot has no calibration file, and
+            // `--fake` deliberately has none, which is what keeps the bench able to move.
+            calibration: ArcSwapOption::empty(),
+            bus_sample: ArcSwapOption::empty(),
+            slow: ArcSwapOption::empty(),
+            // A daemon that has not opened its bus yet is *configuring* it, which is one of the
+            // startup phases a client is told to wait through.
+            bus_phase: AtomicU8::new(BusPhase::ConfiguringBus as u8),
+            bus_backend_name: ArcSwapOption::empty(),
+            commissioning: AtomicBool::new(false),
+            torque_state: AtomicU8::new(0),
+            torque_off_pending: AtomicBool::new(false),
+            missing_total: AtomicU64::new(0),
+            command_clamps_total: AtomicU64::new(0),
+            stale_joint_ids: ArcSwap::from_pointee(Vec::new()),
+            sample_revision: AtomicU64::new(0),
+            hold_stage: AtomicU8::new(0),
+            hold_error_deg: AtomicU64::new(0),
+            calibration_path: params
+                .bus
+                .feetech
+                .calibration
+                .clone()
+                .unwrap_or_else(|| robotd_params::calibration::DEFAULT_PATH.to_owned()),
+            bus_command: std::sync::Mutex::new(None),
             shutdown: AtomicBool::new(false),
             flashlight: AtomicU8::new(0),
             has_flashlight: leds::flashlight_fitted(),
@@ -930,6 +1364,329 @@ impl RobotState {
         describe(true, false, None)
     }
 
+    /// What the wire is doing, as `robot.busStatus` reports it.
+    ///
+    /// Assembled from what the loop already publishes rather than by touching the serial port:
+    /// this is answered about once a second per connected page, sometimes at 10 Hz, and a status
+    /// call that took a bus transaction would be competing with the control loop for the wire.
+    /// Everything here is therefore a *report* of the last tick — `sample_age_ms` is on the wire
+    /// precisely so a client can see how old it is instead of assuming it is live.
+    ///
+    /// Absent stays absent: a joint that did not report a voltage is `null`, not `0.0`, and a
+    /// robot whose bus has never answered has `sample_age_ms: null` rather than a fresh-looking
+    /// zero. The Studio draws "unknown" and "0 V" very differently, and it is right to.
+    fn bus_status(&self) -> proto::BusStatus {
+        let phase = BusPhase::of(self.bus_phase.load(Ordering::Relaxed));
+        let sample = self.bus_sample.load_full();
+        let slow = self.slow.load_full();
+        let calibration = self.calibration.load_full();
+        let revision = self.sample_revision.load(Ordering::Relaxed);
+        let consecutive_errors = self.consecutive_errors.load(Ordering::Relaxed);
+        let sample_age_ms = sample.as_ref().map(|s| {
+            (self.started.elapsed().as_secs_f64() * 1000.0 - s.at_ms).max(0.0)
+        });
+        // Fresh means "the last read worked and is recent enough to act on": three loop periods
+        // of slack, so one late tick is not reported as a dead bus.
+        let fresh_window_ms = (self.period_us as f64 / 1000.0) * 3.0;
+        let feedback_fresh = sample_age_ms.is_some_and(|age| {
+            age <= fresh_window_ms && consecutive_errors == 0
+        });
+        // `all_enabled`, not `on`: this is the word the calibration page's coarse guard
+        // compares against, and it is the honest one — the bus layer only reports it once every
+        // servo has confirmed its own torque bit, so "on" as a *command* never appears here.
+        let torque_state = match self.torque_state.load(Ordering::Relaxed) {
+            1 => "all_enabled",
+            2 => "off",
+            _ => "unknown",
+        };
+        let imu = sample.as_ref().and_then(|s| s.imu.clone());
+        let stale = self.stale_joint_ids.load();
+        let cal = calibration.as_deref();
+        // A hold is a phase of its own for as long as it lasts: the bench starts one and then
+        // polls this field, so it has to survive the answer that started it.
+        let hold = match self.hold_stage.load(Ordering::Relaxed) {
+            1 => Some(proto::BusHold {
+                stage: "ramping".to_owned(),
+                max_error_deg: None,
+            }),
+            2 => Some(proto::BusHold {
+                stage: "holding".to_owned(),
+                max_error_deg: Some(f64::from_bits(
+                    self.hold_error_deg.load(Ordering::Relaxed),
+                )),
+            }),
+            _ => None,
+        };
+
+        proto::BusStatus {
+            mode: self.mode_name(),
+            phase: phase.name().to_owned(),
+            torque_state: torque_state.to_owned(),
+            torque_off_pending: self.torque_off_pending.load(Ordering::Relaxed),
+            policy_enabled: self.policy_enabled,
+            hold,
+            backend: self.bus_backend(),
+            native: proto::BusNative {
+                torque_state_confirmed: torque_state == "all_enabled",
+                feedback_fresh,
+                sample_age_ms,
+                joints: (0..duck_control::NUM_JOINTS)
+                    .map(|joint| proto::BusJoint {
+                        name: duck_control::JOINT_NAMES
+                            .get(joint)
+                            .copied()
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                        id: *duck_control::model::JOINT_IDS.get(joint).unwrap_or(&0),
+                        volts: slow
+                            .as_ref()
+                            .map(|s| s.joint_volts[joint])
+                            .filter(|v| *v > 0.0),
+                        temp_c: slow.as_ref().map(|s| s.temps_c[joint]),
+                        position_rad: sample
+                            .as_ref()
+                            .and_then(|s| s.joints.get(joint).copied()),
+                        // The tick's sync-read block carries position, voltage, temperature and
+                        // load, not current — and a number invented from load would be a
+                        // diagnostic that lies. `null` is what the page draws as "not reported".
+                        current_ma: None,
+                        feedback_fresh: feedback_fresh
+                            && !stale.contains(duck_control::model::JOINT_IDS.get(joint).unwrap_or(&0)),
+                    })
+                    .collect(),
+                imu_ready: self.imu_ready.load(Ordering::Relaxed),
+                imu_source: imu.as_ref().map(|i| i.source.clone()),
+                imu_mount_verified: cal.is_some_and(|c| c.imu_mount_verified),
+                imu_bus: imu.as_ref().map(|i| proto::BusImuBus {
+                    protocol: i.source.clone(),
+                    board: "imu_to_dxl".to_owned(),
+                    identity: Vec::new(),
+                }),
+                missing_total: self.missing_total.load(Ordering::Relaxed),
+                consecutive_missing: consecutive_errors,
+                command_clamps_total: self.command_clamps_total.load(Ordering::Relaxed),
+                stale_joint_ids: stale.as_ref().clone(),
+                // Every joint that is not stale and is under torque is being held: this bus has no
+                // separate "holding" register, and a servo with torque on is holding its position.
+                held_joint_ids: if torque_state == "all_enabled" {
+                    duck_control::model::JOINT_IDS
+                        .iter()
+                        .copied()
+                        .filter(|id| !stale.contains(id))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                hd1910: proto::BusHd1910 {
+                    motion_enabled: cal.is_some_and(|c| c.motion_enabled),
+                    calibration_complete: cal.is_some_and(|c| c.is_complete()),
+                    restore_pending: false,
+                    temporary_gains_applied: false,
+                    imu_mount_verified: cal.is_some_and(|c| c.imu_mount_verified),
+                    gain_mode: if torque_state == "all_enabled" {
+                        "stiff"
+                    } else {
+                        "limp"
+                    }
+                    .to_owned(),
+                },
+                loaded_models: self.loaded_models(),
+                last_sample: sample.as_deref().cloned(),
+                revision,
+            },
+        }
+    }
+
+    /// The answer to `calibration-status`, built from the file this daemon holds.
+    ///
+    /// Answered from the copy in memory rather than by re-reading the path, because that copy is
+    /// what the servos are actually being driven with: a file edited underneath a running daemon
+    /// would make this report something the robot is not doing.
+    fn calibration_status(&self) -> proto::BusCalibration {
+        let calibration = self.calibration.load_full();
+        let cal = calibration.as_deref();
+        proto::BusCalibration {
+            imu_source: imu_source_name(cal),
+            imu_mount: proto::BusImuMount {
+                quat: cal
+                    .map(|cal| cal.bus_mount())
+                    .unwrap_or(robotd_params::calibration::DEFAULT_BUS_QUAT),
+                verified: cal.is_some_and(|cal| cal.imu_mount_verified),
+            },
+            calibration: cal.map(|cal| cal.to_json()),
+            path: self.calibration_path.clone(),
+        }
+    }
+
+    /// Serve one `robot.busCommand`, waiting for the bus where the command needs it.
+    ///
+    /// `calibration-status` is answered here, from the file: it is the call a page makes while it
+    /// is still deciding what to do, and making that queue behind a move would lock the page out
+    /// of the screen it needs to see the move happening on.
+    ///
+    /// The other two are handed to the control loop and awaited. That wait is the point — a
+    /// `hold-home` that returned as soon as it was accepted would tell the bench a pose had
+    /// arrived before the servos had moved, and the bench would start measuring a robot mid-ramp.
+    async fn run_bus_command(
+        &self,
+        command: proto::BusCommandParams,
+    ) -> Result<serde_json::Value, String> {
+        if matches!(command, proto::BusCommandParams::CalibrationStatus) {
+            let status = self.calibration_status();
+            return serde_json::to_value(status)
+                .map_err(|e| format!("cannot describe the calibration: {e}"));
+        }
+        let action = command.action();
+        // Room for the hold's own ramp and settle, or for the whole twenty-second gesture plus the
+        // write — and in both cases comfortably inside Studio's 20 s and 35 s timeouts, so the page
+        // reads our explanation instead of its own timeout.
+        let wait = match &command {
+            proto::BusCommandParams::VerifyImu { .. } => Duration::from_secs(30),
+            _ => Duration::from_secs(20),
+        };
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        {
+            let mut slot = self
+                .bus_command
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_some() {
+                return Err(
+                    "another bus command is still running: wait for it to finish, then try again"
+                        .to_owned(),
+                );
+            }
+            *slot = Some(BusCommandRequest { command, reply });
+        }
+
+        match tokio::time::timeout(wait, answer).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(e))) => Err(e),
+            // The sender went away: the loop that owns the wire stopped, or a newer command took
+            // the slot. Saying which is not possible from here, so say what is true.
+            Ok(Err(_)) => Err(format!(
+                "{action} was dropped before it finished: the control loop stopped"
+            )),
+            Err(_) => Err(format!(
+                "{action} did not finish within {} s: check the robot and try again. Nothing saved.",
+                wait.as_secs()
+            )),
+        }
+    }
+
+    /// Record what the bus said this tick, for `robot.busStatus` to report.
+    ///
+    /// Called from the control thread, which is the only owner of the io handle — the IPC side
+    /// reads the snapshot this leaves behind and never touches the wire. Published every tick
+    /// rather than once a second like the thermal sample, because `sample_age_ms` is how a client
+    /// tells "the servos just answered" from "the answer you got is a second old", and that only
+    /// means anything at tick resolution.
+    fn publish_bus_sample(
+        &self,
+        sensors: Option<&duck_control::Sensors>,
+        imu_ready: bool,
+        read_age_ms: f64,
+    ) {
+        let Some(sensors) = sensors else {
+            // No sample at all yet — a robot that has never read its servos. Leave the last one
+            // alone rather than publish a zero-filled frame that would look like a robot lying at
+            // the origin with every joint at 0 rad.
+            return;
+        };
+        let quat = sensors.imu.quat;
+        // Unit length to within what a per-axis fp16 block can carry. This is the check the page
+        // needs and nothing more: `ready` below is the orientation filter's own word, and a
+        // quaternion that arrives unit-length here is one a bubble level may be drawn from.
+        // Deliberately not compared against the all-defaults value — an upright robot at rest has
+        // gravity exactly `[0, 0, -1]`, which is the same number a backend that never read a
+        // board would leave behind.
+        let norm = quat.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let valid = norm.is_finite() && (norm - 1.0).abs() <= 5e-2;
+        let gravity = sensors.imu.gravity;
+        let tilt_deg = (-gravity[2]).clamp(-1.0, 1.0).acos().to_degrees();
+
+        self.bus_sample.store(Some(std::sync::Arc::new(proto::BusSample {
+            at_ms: self.started.elapsed().as_secs_f64() * 1000.0,
+            imu: Some(proto::BusImuSample {
+                valid,
+                // The IMU on either backend is the board on the servo wire, never a head-mounted
+                // chip — this daemon reports a head IMU separately, on `head_imu.stream`.
+                source: "bus".to_owned(),
+                gravity,
+                quaternion_wxyz: quat,
+                tilt_deg,
+                ready: imu_ready,
+                age_ms: Some(read_age_ms),
+            }),
+            joints: sensors.positions.to_vec(),
+        })));
+        self.sample_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record torque as the servos confirmed it.
+    ///
+    /// Called where a torque write actually landed, never where it was merely asked for — which
+    /// is what makes `native.torque_state_confirmed` mean "the servos are holding" rather than
+    /// "somebody pressed a button". Clearing `torque_off_pending` here is the other half of that
+    /// flag's job: it covers exactly the window between the request and this call.
+    fn note_torque(&self, on: bool) {
+        self.torque_state
+            .store(if on { 1 } else { 2 }, Ordering::Relaxed);
+        self.torque_off_pending.store(false, Ordering::Relaxed);
+    }
+
+    /// `motion` or `commissioning`: which of the two daemons this is.
+    fn mode_name(&self) -> String {
+        if self.commissioning.load(Ordering::Relaxed) {
+            "commissioning".to_owned()
+        } else {
+            "motion".to_owned()
+        }
+    }
+
+    /// The wire the servos speak, as `robot.busStatus` reports it.
+    ///
+    /// From the loaded config rather than from the open bus, which lives on the control thread:
+    /// a status call must not need the loop's io handle. `None` until the config has been read.
+    fn bus_backend(&self) -> String {
+        self.bus_backend_name
+            .load()
+            .as_ref()
+            .map(|name| (**name).clone())
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    /// Which policy file each slot is running, for the calibration pages' "in use" badge.
+    ///
+    /// Slot names rather than file paths as the key, and the same names `robot.policies` uses, so
+    /// a page can join the two answers without guessing. `runtime_execution_profile` is how the
+    /// Studio asks "is the daemon driving this model right now", and this daemon runs every slot
+    /// on the onboard runtime, so it is a constant string rather than a guess.
+    fn loaded_models(&self) -> serde_json::Value {
+        let names = self.policies.load();
+        let mut models = serde_json::Map::new();
+        let mut put = |slot: &str, file: &Option<String>| {
+            if let Some(file) = file {
+                models.insert(
+                    slot.to_owned(),
+                    serde_json::json!({
+                        "file": file,
+                        "runtime_execution_profile": "onboard",
+                    }),
+                );
+            }
+        };
+        put("walk", &names.walk);
+        put("stand", &names.stand);
+        put("sitstand", &names.sitstand);
+        put("ground_pick", &names.ground_pick);
+        for skill in &names.skills {
+            put(skill, &Some(skill.clone()));
+        }
+        serde_json::Value::Object(models)
+    }
+
     /// The loop's own numbers, as the readout reports them.
     fn loop_health(&self) -> proto::LoopHealth {
         let hz = f64::from_bits(self.achieved_hz.load(Ordering::Relaxed));
@@ -1033,6 +1790,13 @@ async fn main() -> ExitCode {
     if args.no_policy {
         params.policy.enabled = false;
     }
+    if args.commissioning {
+        // Same switch as `--no-policy`, for the same reason: a bench daemon must not walk. What
+        // it adds is the rest of it — `robot.busCommand` is accepted here, `busStatus` says
+        // `commissioning`, and the four startup phases give way to `holding` while a pose is held.
+        // `robot.enable` still ramps to home and holds, which is the one motion calibrating needs.
+        params.policy.enabled = false;
+    }
 
     if let Some(Command::Init { duration }) = args.command {
         // init opens the motor bus itself. Keep ownership until the whole ramp returns,
@@ -1060,6 +1824,18 @@ async fn main() -> ExitCode {
     duck_ipc_proto::log_startup_identity!("robotd");
 
     let mut state = RobotState::new(&params, &params_path, args.unhealthy, args.busy);
+    // Set once, before the socket is served, so the very first `robot.busStatus` already knows
+    // which of the two daemons answered it — a page that had to wait for a later poll to learn
+    // it is in commissioning would offer the wrong buttons for a moment.
+    state
+        .commissioning
+        .store(args.commissioning, Ordering::Relaxed);
+    if args.commissioning {
+        tracing::warn!(
+            "commissioning mode: no policy, no motion — the robot holds poses on request and \
+             `robot.busCommand` is accepted"
+        );
+    }
     let vetbook_path = args.vetbook.clone().or_else(|| {
         (!args.fake && args.sim.is_none()).then(|| PathBuf::from(vetbook::DEFAULT_PATH))
     });
@@ -1154,12 +1930,16 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
     let mut adopted = None;
+    // The same calibration the daemon would use, so `init` puts the robot where the daemon
+    // would consider home — a zero the bench measured, not the servo's own centre.
+    let calibration = calibration_from(&params.bus);
     let opened = open_bus(
         &params.bus,
         params.board.version,
         0,
         &mut Vec::new(),
         &mut adopted,
+        calibration.as_ref(),
     );
     // The daemon is stopped while `init` runs — it holds the same lock — so the book is this
     // process's to write.
@@ -1278,8 +2058,11 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             // Refused here rather than retried: a direction list of the wrong length does not
-            // fix itself, and waiting on it would read as "servo power is off".
-            if let Err(e) = bus_protocol(&params.bus) {
+            // fix itself, and waiting on it would read as "servo power is off". The calibration
+            // is read the same way the loop will read it, so a bad file is refused here too —
+            // before the thread that would retry it forever is even started.
+            let calibration = calibration_from(&params.bus);
+            if let Err(e) = bus_protocol(&params.bus, calibration.as_ref()) {
                 tracing::error!(error = %e, "invalid [bus] parameters; no control loop");
                 return;
             }
@@ -1375,14 +2158,45 @@ type BusIo = FakeIo;
 /// Returns `None` only if shutdown is requested while waiting.
 async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo> {
     let mut attempt = 0u32;
+    state
+        .bus_phase
+        .store(BusPhase::WaitingForBus as u8, Ordering::Relaxed);
+    // Known from the config before a byte goes out, which is what lets `robot.busStatus` name
+    // the wire on a robot whose servos are still unpowered — the one case where somebody is
+    // staring at the page trying to work out what is wrong.
+    state.bus_backend_name.store(Some(std::sync::Arc::new(
+        match bus.protocol {
+            params::BusProtocol::Dynamixel2 => "dynamixel2",
+            params::BusProtocol::FeetechSts => "feetech-sts",
+        }
+        .to_owned(),
+    )));
 
     while !state.shutdown.load(Ordering::Relaxed) {
+        // Reloaded while the slot is still empty rather than only once at startup: the bench
+        // writes this file, and a robot that is waiting for servo power is exactly the robot
+        // somebody is calibrating. Once it has loaded, the in-memory copy wins — `verify-imu`
+        // rewrites it, and re-reading on every retry would fight that.
+        if state.calibration.load().is_none()
+            && let Some(cal) = calibration_from(bus)
+        {
+            state.calibration.store(Some(std::sync::Arc::new(cal)));
+        }
+        let calibration = state.calibration.load_full();
+
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
         let mut missing = Vec::new();
         let mut imu_missing = false;
         let mut adopted = None;
-        let opened = open_bus(bus, state.board, attempt, &mut missing, &mut adopted);
+        let opened = open_bus(
+            bus,
+            state.board,
+            attempt,
+            &mut missing,
+            &mut adopted,
+            calibration.as_deref(),
+        );
         // Written down whether or not the rest of the bring-up works: the servo is in the joint
         // now, flashed to its ID, and the next attempt will not see it as new.
         if let Some(id) = adopted {
@@ -1394,6 +2208,12 @@ async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo
                     state.startup_bus_failures.store(0, Ordering::Relaxed);
                     state.startup_missing.store(Arc::new(Vec::new()));
                     state.startup_imu_missing.store(false, Ordering::Relaxed);
+                    // The bus is open and every servo answered: from here the only phase left
+                    // is `control` (or `moving`/`holding` in commissioning), and the loop that
+                    // sets those is about to start.
+                    state
+                        .bus_phase
+                        .store(BusPhase::Ready as u8, Ordering::Relaxed);
                     return Some(io);
                 }
                 Some(false) => imu_missing = true,
@@ -1439,6 +2259,7 @@ fn open_bus(
     attempt: u32,
     missing: &mut Vec<u8>,
     adopted: &mut Option<u8>,
+    calibration: Option<&robotd_params::calibration::Calibration>,
 ) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
@@ -1446,7 +2267,7 @@ fn open_bus(
 
     // The protocol choice is validated before anything touches the port, so a bad
     // `directions` length is a config error, not a mysterious bus failure.
-    let protocol = match bus_protocol(bus) {
+    let protocol = match bus_protocol(bus, calibration) {
         Ok(protocol) => protocol,
         Err(e) => {
             if loud {
@@ -1548,15 +2369,66 @@ fn imu_answers(_io: &mut BusIo, _attempt: u32) -> Option<bool> {
 ///
 /// The parameter crate holds plain values and does not link the control crate, so the checks
 /// that need to know what a joint is — one direction per joint, each of them ±1 — happen here.
-fn bus_protocol(bus: &params::Bus) -> Result<BusProtocol, String> {
+///
+/// `calibration` is the bench's file when one loaded, and `None` on a robot that has never been
+/// calibrated. The distinction is not cosmetic: the zero the file carries is what makes a radian
+/// mean the same thing to the policy as it did on the bench, and a missing file therefore means
+/// "factory centre, unbounded travel" rather than a refusal — a freshly flashed robot has to be
+/// able to move far enough to be calibrated.
+fn bus_protocol(
+    bus: &params::Bus,
+    calibration: Option<&robotd_params::calibration::Calibration>,
+) -> Result<BusProtocol, String> {
     Ok(match bus.protocol {
         params::BusProtocol::Dynamixel2 => BusProtocol::Dynamixel2,
-        params::BusProtocol::FeetechSts => BusProtocol::FeetechSts(FeetechConfig::new(
-            bus.feetech.p_scale,
-            &bus.feetech.directions,
-            bus.feetech.imu,
-        )?),
+        params::BusProtocol::FeetechSts => {
+            let (zeros, limits) = match calibration {
+                Some(cal) => (cal.zeros(), cal.limits()),
+                None => {
+                    let factory = FeetechConfig::default();
+                    (factory.zeros, factory.limits)
+                }
+            };
+            BusProtocol::FeetechSts(FeetechConfig::new(
+                bus.feetech.p_scale,
+                &bus.feetech.directions,
+                zeros,
+                limits,
+                bus.feetech.imu,
+            )?)
+        }
     })
+}
+
+/// The calibration file `[bus.feetech] calibration` names, if it names one that parses.
+///
+/// A file that is missing or will not parse is a warning, not a refusal: the robot still has to
+/// stand up so somebody can fix it, and the factory centre is exactly the pose a servo that has
+/// never been calibrated already reports. `robot.busStatus` says `calibration_complete: false`,
+/// and `robot.busCommand calibration-status` names the path it looked at.
+fn calibration_from(
+    bus: &params::Bus,
+) -> Option<robotd_params::calibration::Calibration> {
+    let path = bus.feetech.calibration.as_deref()?;
+    match robotd_params::calibration::Calibration::load(std::path::Path::new(path)) {
+        Ok(cal) => {
+            tracing::info!(
+                path,
+                calibrated = cal.all_calibrated(),
+                imu_mount_verified = cal.imu_mount_verified,
+                "calibration file loaded"
+            );
+            Some(cal)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path,
+                error = %e,
+                "calibration file not loaded; joints use the factory centre and unbounded travel"
+            );
+            None
+        }
+    }
 }
 
 /// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
@@ -1638,6 +2510,7 @@ fn open_bus(
     _attempt: u32,
     _missing: &mut Vec<u8>,
     _adopted: &mut Option<u8>,
+    _calibration: Option<&robotd_params::calibration::Calibration>,
 ) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
@@ -2404,6 +3277,9 @@ async fn control_loop<T: RobotIo>(
     // `robot.state` timestamp by one inference otherwise. It rides the coast: a coasted tick
     // republishes the last fresh sample, so it must republish that sample's read time too.
     let mut sensors_read_ns = 0u64;
+    // Whatever `robot.busCommand` is currently doing to this robot. Here, in the loop, because
+    // both kinds of work end in something only the loop can do: write a target, or read the IMU.
+    let mut bench: Option<Bench> = None;
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
@@ -2450,6 +3326,22 @@ async fn control_loop<T: RobotIo>(
         // `known_positions` only advances on fresh ones, so a coasted tick cannot pretend to
         // know where the joints have moved to.
         let sensors = coast.sample(fresh);
+
+        // What `robot.busStatus` and `last_sample` are built from. Published every tick, coasted
+        // ones included: the age rides along, so a page can see the difference between "the
+        // servos said this just now" and "this is the last thing they said before they stopped".
+        state.publish_bus_sample(
+            sensors.as_ref(),
+            safety.imu_ready(),
+            (proto::clock::monotonic_ns().saturating_sub(sensors_read_ns)) as f64 / 1e6,
+        );
+        // The bus is up and this loop is driving it; from here the phase only changes to say what
+        // the robot is *doing* (moving, holding), never that it is waiting.
+        if state.bus_phase.load(Ordering::Relaxed) != BusPhase::Control as u8 {
+            state
+                .bus_phase
+                .store(BusPhase::Control as u8, Ordering::Relaxed);
+        }
 
         if let Some(fresh) = fresh.as_ref() {
             safety.observe(fresh, period);
@@ -2533,6 +3425,7 @@ async fn control_loop<T: RobotIo>(
             Some(intents::PowerRequest::Relax) => match safety.set_torque(false) {
                 Ok(()) => {
                     tracing::warn!("robot.relax: torque off");
+                    state.note_torque(false);
                     // Back to the start, so the next `init` or Start ramps from wherever the robot
                     // ends up rather than assuming it is still at the home pose.
                     bringup = Bringup::Limp;
@@ -2566,6 +3459,9 @@ async fn control_loop<T: RobotIo>(
             if let Err(e) = safety.set_torque(false) {
                 tracing::warn!(error = %e, "robot.rebootMotors: torque off failed on a servo; rebooting anyway");
             }
+            // Whatever the write said, the servos are about to disappear from the bus and come
+            // back limp — so this is the one place where "off" is the answer either way.
+            state.note_torque(false);
             vettally.motor_reboot();
             match safety.reboot_motors(&ids) {
                 Ok(()) => tracing::warn!(
@@ -3847,9 +4743,20 @@ async fn control_loop<T: RobotIo>(
             watch.commanded(&targets);
         }
 
+        // The calibration bench has the last word on the target: a hold is a command from a
+        // person standing next to the robot, and it outranks whatever a policy or a skill had in
+        // mind. It runs here rather than earlier because it needs the positions just read.
+        bench = bench_tick(bench, &state, sensors.as_ref(), period, &mut targets);
+
         last_targets = targets;
         match safety.apply(targets, hold, gain) {
-            Ok(applied) => limits.extend(applied.limits),
+            Ok(applied) => {
+                limits.extend(applied.limits);
+                // A target written to a servo that answered is the only proof of torque this
+                // daemon ever gets: `set_torque` returns when the bytes are acknowledged, and a
+                // servo that refuses to hold is one that will not take a goal either.
+                state.note_torque(true);
+            }
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
         }
 
@@ -4142,6 +5049,11 @@ fn publish_slow_sensors<T: RobotIo>(
 
     match io.slow_sensors() {
         Ok(slow) => {
+            // Kept whole, for `robot.busStatus`'s per-joint volts and temperatures. An `Arc`
+            // because the control thread stores and the IPC thread loads the same reading, and
+            // a per-joint copy on every poll would be fifteen values nobody needed twice.
+            let slow = std::sync::Arc::new(slow);
+            state.slow.store(Some(std::sync::Arc::clone(&slow)));
             let previous = f64::from_bits(state.battery_v.load(Ordering::Relaxed));
             // Seed from the first reading rather than blending up from zero, which would
             // spend ten seconds reporting a battery flatter than it is.
@@ -4516,10 +5428,33 @@ async fn handle(
         }
 
         let response = match call {
-            Ok(call) => dispatch(&state, &intents, id, &call),
+            Ok(call) => dispatch_call(&state, &intents, id, call).await,
             Err(e) => proto::Response::err(Some(id), e),
         };
         write_line(&mut write_half, &response).await?;
+    }
+}
+
+/// Answer one request, awaiting the bus when the request needs the servos.
+///
+/// [`dispatch`] is synchronous because almost every call is a read of shared state, and that is
+/// not a style choice: a page polling `robot.busStatus` at 10 Hz must never be able to queue
+/// behind a three-second move. The calibration commands are the exception — they *are* the move,
+/// and their answer is only honest once the move has finished.
+async fn dispatch_call(
+    state: &RobotState,
+    intents: &Intents,
+    id: proto::Id,
+    call: proto::Call,
+) -> proto::Response {
+    match call {
+        proto::Call::RobotBusCommand(command) => match state.run_bus_command(command).await {
+            Ok(value) => proto::Response::ok(Some(id), &value),
+            Err(e) => {
+                proto::Response::err(Some(id), proto::Error::new(proto::code::INVALID_REQUEST, e))
+            }
+        },
+        other => dispatch(state, intents, id, &other),
     }
 }
 
@@ -5576,6 +6511,20 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // A report of the last tick, never a bus transaction: a page polls this at 10 Hz while the
+        // loop is driving fifteen servos on the same wire, and a status call that took the bus
+        // would be competing with the thing it is reporting on.
+        proto::Call::RobotBusStatus => proto::Response::ok(Some(id), &state.bus_status()),
+        // Reached only by a caller that cannot await — the real path is `dispatch_call`. Saying so
+        // is better than letting it fall through to "not served by robotd", which would send
+        // somebody looking for a missing feature that is in fact right here.
+        proto::Call::RobotBusCommand(_) => proto::Response::err(
+            Some(id),
+            proto::Error::new(
+                proto::code::INVALID_REQUEST,
+                "robot.busCommand moves the robot and has to be awaited".to_owned(),
+            ),
+        ),
         proto::Call::RobotHealth => proto::Response::ok(Some(id), &state.health()),
         proto::Call::RobotSafeToRestart => proto::Response::ok(Some(id), &state.safe_to_restart()),
         proto::Call::RobotModelApi => proto::Response::ok(
@@ -6453,6 +7402,136 @@ mod tests {
         off.policy.enabled = false;
         let none = PolicyNames::of(&off.policy.resolved());
         assert!(none.walk.is_none() && none.skills.is_empty());
+    }
+
+    /// The bench path end to end, minus the socket: `hold-home` becomes a held pose, and
+    /// `robot.busStatus` then carries the `holding` stage and the error the coarse-calibration
+    /// guard reads. `FakeIo` is used deliberately — this is the mode a bench twin is for.
+    #[test]
+    fn hold_home_holds_and_reports_how_far_from_home_it_is() {
+        let params = Params::default();
+        let state = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        state.commissioning.store(true, Ordering::Relaxed);
+
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        let sensors = io.read().expect("fake read");
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        *state.bus_command.lock().unwrap() = Some(BusCommandRequest {
+            command: proto::BusCommandParams::HoldHome {
+                directions: vec![1; NUM_JOINTS],
+                duration_ms: Some(200),
+            },
+            reply: tx,
+        });
+        let mut bench = take_bus_command(&state, Some(&sensors));
+        assert!(bench.is_some(), "the command should have been taken");
+        assert_eq!(
+            state.bus_status().hold.map(|hold| hold.stage),
+            Some("ramping".to_owned())
+        );
+
+        // 200 ms ramp, then the 400 ms settle before the answer — well inside 40 ticks.
+        let mut targets = [0.0; NUM_JOINTS];
+        for _ in 0..40 {
+            bench = bench_tick(
+                bench,
+                &state,
+                Some(&sensors),
+                Duration::from_millis(20),
+                &mut targets,
+            );
+            if bench.is_none() {
+                break;
+            }
+        }
+        assert!(
+            bench.is_some(),
+            "a held pose is kept: the bench is what is holding it"
+        );
+        let answer = rx.try_recv().expect("an answer").expect("held");
+        assert_eq!(answer["stage"], "holding");
+        // Interpolation leaves a fraction of a degree, not an exact zero — what matters is that it
+        // is inside the tolerance a calibration may be taken on.
+        let reported = answer["max_error_deg"].as_f64().expect("a number");
+        assert!(reported < 1.0, "{reported}");
+
+        let status = state.bus_status();
+        assert_eq!(status.mode, "commissioning");
+        assert_eq!(status.torque_state, "unknown");
+        let hold = status.hold.expect("a held pose");
+        assert_eq!(hold.stage, "holding");
+        assert!(hold.max_error_deg.expect("a number") < 1.0);
+
+        // And relax is how it ends, which is the rule Studio states: the pose goes, the stage
+        // clears, and nothing is left claiming to hold a limp robot.
+        state.note_torque(false);
+        let mut bench = bench;
+        for _ in 0..2 {
+            bench = bench_tick(
+                bench,
+                &state,
+                Some(&sensors),
+                Duration::from_millis(20),
+                &mut targets,
+            );
+            if bench.is_none() {
+                break;
+            }
+        }
+        assert!(bench.is_none(), "relax ends the hold");
+        assert_eq!(state.bus_status().hold.map(|hold| hold.stage), None);
+    }
+
+    /// A pose that cannot be reached is refused rather than held forever: pushing a joint that is
+    /// blocked is how a servo cooks, and the client needs to hear which joint it was not.
+    #[test]
+    fn a_hold_that_cannot_be_reached_is_refused_with_the_error() {
+        let params = Params::default();
+        let state = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        let mut sensors = io.read().expect("fake read");
+        // A joint the fake bus will never move: the hold sees it stuck 20° out.
+        sensors.positions[0] += 20f64.to_radians();
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        state.bus_command.lock().unwrap().replace(BusCommandRequest {
+            command: proto::BusCommandParams::HoldHome {
+                directions: vec![1; NUM_JOINTS],
+                duration_ms: Some(200),
+            },
+            reply: tx,
+        });
+        let mut bench = take_bus_command(&state, Some(&sensors));
+        assert!(bench.is_some(), "the command should have been taken");
+        let mut targets = [0.0; NUM_JOINTS];
+        for _ in 0..40 {
+            bench = bench_tick(
+                bench,
+                &state,
+                Some(&sensors),
+                Duration::from_millis(20),
+                &mut targets,
+            );
+            if bench.is_none() {
+                break;
+            }
+        }
+        assert!(bench.is_none(), "a refused hold is not kept");
+        let error = rx.try_recv().expect("an answer").expect_err("refused");
+        assert!(error.contains("still"), "{error}");
+        assert!(error.contains("from home"), "{error}");
+        assert!(error.contains("Nothing saved"), "{error}");
     }
 
     #[test]

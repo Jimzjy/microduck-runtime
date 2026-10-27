@@ -642,6 +642,7 @@ impl RobotIo for DynamixelIo {
         }
 
         let mut temps_c = [0.0; NUM_JOINTS];
+        let mut joint_volts = [0.0; NUM_JOINTS];
         let mut volts = Vec::with_capacity(NUM_JOINTS);
         for (joint, block) in blocks.iter().enumerate() {
             if block.len() != SLOW_READ_LEN as usize {
@@ -654,6 +655,7 @@ impl RobotIo for DynamixelIo {
             // [0..2] present_input_voltage · [2] present_temperature, already in whole °C.
             let counts = u16::from_le_bytes([block[0], block[1]]);
             let v = counts as f64 * VOLTS_PER_COUNT;
+            joint_volts[joint] = v;
             if v > 0.0 {
                 volts.push(v);
             }
@@ -670,6 +672,7 @@ impl RobotIo for DynamixelIo {
         Ok(SlowSensors {
             volts: volts.iter().sum::<f64>() / volts.len() as f64,
             temps_c,
+            joint_volts,
         })
     }
 

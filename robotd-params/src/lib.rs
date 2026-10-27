@@ -17,6 +17,7 @@
 //! the registry (and therefore the editor) learning about it.
 
 pub mod board;
+pub mod calibration;
 pub mod edit;
 pub mod registry;
 pub mod serial;
@@ -2362,6 +2363,18 @@ pub struct BusFeetech {
     /// a bus with no board fitted: the read is one block shorter, and the daemon runs without a
     /// policy — the same thing it does on a Dynamixel bus whose board does not answer.
     pub imu: bool,
+    /// The calibration file this bus was measured for, if any —
+    /// [`calibration::DEFAULT_PATH`] on a duck.
+    ///
+    /// When it is set and readable, the file owns every joint's zero, direction and travel
+    /// limits, and it owns whether motion is allowed at all; `directions` above is then only the
+    /// fallback for a bus that has never been calibrated. That split is deliberate: the file is
+    /// written on the bench by a program that also has to read it back, so it is the record,
+    /// while this params file is the daemon's own configuration and ships with defaults.
+    ///
+    /// `None` (or an empty string) is a bus with no calibration file: `directions` applies, and
+    /// motion stays allowed, which is what a laptop with `--fake` and a bare test rig want.
+    pub calibration: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2444,6 +2457,7 @@ impl Default for BusFeetech {
             p_scale: 0.16,
             directions: vec![1; 15],
             imu: true,
+            calibration: None,
         }
     }
 }

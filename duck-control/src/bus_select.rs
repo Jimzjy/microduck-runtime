@@ -150,6 +150,10 @@ impl RobotIo for AnyBus {
     fn imu_ready(&self) -> bool {
         each!(self, io => io.imu_ready())
     }
+
+    fn cached_slow(&self) -> Option<SlowSensors> {
+        each!(self, io => io.cached_slow())
+    }
 }
 
 #[cfg(test)]

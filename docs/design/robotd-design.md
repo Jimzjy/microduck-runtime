@@ -889,6 +889,69 @@ own namespace so the relay's per-transport allow-list can keep them off remote t
 Signaling gating decides *who connects*; it does not say a teleoperator is also a mechanic — and
 `update.*` reaching a DataChannel would mean a remote peer can trigger a rollback.
 
+### 3.6 The calibration bench, which is the same daemon
+
+A robot on a bench has to be *settable* and *measurable* before it can be driven: joints powered and
+held at home, the IMU's mounting quaternion derived from the body, and both facts written where the
+next boot will find them. Studio does that with two calls and a mode flag, and none of the three is
+a motion intent — a gait fighting the person doing the measuring is the one thing that must not
+happen.
+
+`robotd --commissioning` is the same binary with the policy switched off, exactly as `--no-policy`
+does, plus the two calls below and `mode: "commissioning"` on the status. It is a flag, not a config
+value, because on a factory image its presence *is* the state: a drop-in that is deleted once
+calibration is committed. `robot.enable` still ramps to home and holds — that is the one motion a
+bench needs.
+
+**`robot.busStatus` never touches the bus.** It is assembled from the snapshots the loop already
+publishes: the last sample, the slow-sensor reading, the torque bookkeeping, the phase. A client
+polls it, and a client must not be able to reach into a 50 Hz control loop through a read — nor
+would a second bus transaction be free, since the port is owned by the loop. Anything the snapshot
+does not know is `null` rather than a plausible zero: a joint with no reading reports no voltage,
+because a `0.0 V` that means "unknown" is a number a battery gauge will happily draw.
+
+Two words in it are load-bearing. `torque_state: "all_enabled"` is reported only once *every* servo
+has confirmed its torque bit — a command is not a state, and a bench tool that starts measuring on
+the strength of a command will measure a limp robot. `hold.stage`/`hold.max_error_deg` come from
+the hold itself, which is why a client can decide whether a pose is good enough to calibrate on
+instead of guessing.
+
+**`robot.busCommand` is answered by the loop.** `dispatch` is synchronous and returns a response —
+it never waits for a tick, because backpressure into the loop is what §4.1 exists to prevent. So
+this call alone goes through `dispatch_call`: it hands the command to the loop through a one-shot
+and awaits the answer with a deadline. A second command while one is in flight is refused by name
+rather than queued, since "hold home" and "verify the IMU" are not a sequence a client can be
+surprised by.
+
+The three actions:
+
+| Action | What the loop does | Deadline |
+|---|---|---|
+| `calibration-status` | Answers from memory, no bus transaction: source, mount, the file as it parsed | none |
+| `hold-home` | Interpolates every joint to home, holds, reports the settled error | 20 s |
+| `verify-imu` | Waits for upright, then for a nose-down tip of 15–30°, then stores the quaternion | 30 s |
+
+`hold-home` is a *stream of targets from the loop's own `apply`*, not a blocking interpolation in
+the handler — which is what produces the settled error the client reads, and what lets `relax`
+interrupt it. A pose that cannot be reached within 5° is given up rather than pushed: a joint that
+cannot get there is a joint that is blocked, and holding it there is how a servo cooks. Every
+refusal ends in the words **"Nothing saved"**, because a bench tool that reports success on a
+failed calibration is worse than one that reports nothing.
+
+**The calibration file is the authority, and `robotd` is not its only writer.** The bench helper
+writes joint zeros, directions and limits; `robotd` writes exactly two fields — the IMU mount and
+its verified bit — and only from `verify-imu`. It is read when the bus opens and re-read on each
+retry, because the helper may be writing while the robot is still waiting for servo power; once
+loaded, the in-memory copy wins, so a write from the other side cannot silently change the zeros
+under a moving robot. The quaternion stored is the one the client sent, normalised: the client reads
+it back after this call and compares component by component, so recomputing it from the sample
+would fail that check for reasons neither side could explain.
+
+`robot.startupSubscribe` is deliberately not implemented. It is a subscription to bring-up steps,
+and the harness that asks for it treats a missing method as "not supported" and carries on; a
+subscription that exists only to be probed would be a second source of truth for bring-up state
+that `robot.state` already carries.
+
 ## 4. Around the loop
 
 ### 4.1 The loop reads snapshots, never waits

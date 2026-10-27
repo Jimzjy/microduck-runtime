@@ -124,9 +124,9 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "bus.feetech",
         Kind::Record(
-            "p_scale = 0.16\ndirections = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\nimu = true",
+            "p_scale = 0.16\ndirections = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\nimu = true\ncalibration = \"/etc/robot/feetech-ft5/hd1910-calibration.toml\"",
         ),
-        "Feetech build only: gain scale and per-joint direction, measured on the bench; imu says whether the board answers at ID 200 — edit robotd.toml by hand",
+        "Feetech build only: gain scale and per-joint direction, measured on the bench; imu says whether the board answers at ID 200; calibration names the file the bench wrote, which then owns zeros, directions and limits — edit robotd.toml by hand",
     ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),

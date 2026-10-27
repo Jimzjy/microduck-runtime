@@ -889,6 +889,16 @@ impl Server {
                 ),
             ),
 
+            // And the calibration bench: both are robotd's, and only robotd can answer them —
+            // one reports what the servos last said, the other moves them.
+            Call::RobotBusStatus | Call::RobotBusCommand(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "robot.busStatus and robot.busCommand are served by robotd, on /run/robotd.sock",
+                ),
+            ),
+
             // Answered by the transport that received it — `btd` checks the PIN itself and never
             // forwards this. Reaching updaterd means a client sent it to the wrong socket, or over
             // a transport that has no PIN gate: on a unix socket, `SO_PEERCRED` already decided who

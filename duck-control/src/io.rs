@@ -90,6 +90,14 @@ pub struct SlowSensors {
     /// the load — a knee holding a squat runs far hotter than the mouth, and a mean over
     /// fifteen servos hides exactly the servo about to latch its overheat shutdown.
     pub temps_c: [f64; NUM_JOINTS],
+    /// Supply voltage each servo reported, in volts, indexed as [`crate::model::JOINT_NAMES`].
+    ///
+    /// `volts` above stays the mean and stays the battery number: that is what the pack holds,
+    /// and the low-battery behaviour is written against it. This array is the diagnostic beside
+    /// it — one joint reading 6.9 V while the other fourteen read 7.4 V is a bad connector, and
+    /// it is what an operator wants on screen while chasing exactly that. Zero means "this servo
+    /// did not say" rather than "0 V", the convention `volts` already follows.
+    pub joint_volts: [f64; NUM_JOINTS],
 }
 
 /// IMU reads that came back byte-for-byte identical to their predecessor.
@@ -202,6 +210,17 @@ pub trait RobotIo {
     fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
         Ok(None)
     }
+
+    /// The slow sensors as of the last control tick, without touching the bus.
+    ///
+    /// [`SlowSensors`] is what the state stream's battery number is built from, and the bus
+    /// reading it costs a transaction. A backend that already carries it from its tick answers
+    /// here; `None` means "ask me with [`RobotIo::slow_sensors`]", which is a bus transaction and
+    /// must not happen on a status call. Defaulted to `None` so a backend that has not cached
+    /// anything does not silently answer with stale numbers it never had.
+    fn cached_slow(&self) -> Option<SlowSensors> {
+        None
+    }
 }
 
 /// What a servo can say about itself — see [`RobotIo::servo_identity`].
@@ -273,6 +292,7 @@ impl FakeIo {
             slow: Some(SlowSensors {
                 volts: 7.4,
                 temps_c: [32.0; NUM_JOINTS],
+                joint_volts: [7.4; NUM_JOINTS],
             }),
             track_targets: true,
             velocity_stated: false,
@@ -383,6 +403,10 @@ impl RobotIo for FakeIo {
 
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
         self.slow.ok_or(IoError::Simulated)
+    }
+
+    fn cached_slow(&self) -> Option<SlowSensors> {
+        self.slow
     }
 }
 

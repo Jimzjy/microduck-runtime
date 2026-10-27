@@ -61,6 +61,13 @@ const VERSION_LEN: u8 = 5;
 const STEPS_PER_REV: f64 = 4096.0;
 const RAW_MAX: i32 = 4095;
 
+/// The middle of a turn: the zero a servo that has never been calibrated is read against.
+///
+/// The same 2048 the shipped calibration file centres every joint on, and the same constant
+/// `robotd-params::calibration::FACTORY_ZERO_RAW` names — kept as a literal here so the bus does
+/// not depend on the params crate for one number.
+const FACTORY_ZERO_RAW: f64 = 2048.0;
+
 /// `present_current` counts 6.5 mA each (STS table, register 69).
 const MILLIAMPS_PER_COUNT: f64 = 6.5;
 
@@ -96,6 +103,19 @@ pub struct FeetechConfig {
     /// +1 or −1 per joint, indexed as [`JOINT_NAMES`]: whether the servo's increasing count is
     /// the model's positive rotation. Measured on the robot, not derived.
     pub directions: [f64; NUM_JOINTS],
+    /// The register count that means 0 rad for each joint, indexed as [`JOINT_NAMES`].
+    ///
+    /// 2048 is the middle of a turn and what a servo that has never been calibrated answers at
+    /// whatever pose it happens to be in, so a robot with no calibration file still moves — it
+    /// just does not know that its "zero" is the pose the bench wants. The calibration file is
+    /// what makes this a measurement; `robotd-params::calibration` carries it.
+    pub zeros: [f64; NUM_JOINTS],
+    /// Travel allowed on each joint, in model radians, indexed as [`JOINT_NAMES`].
+    ///
+    /// Enforced when a target is written, not when a pose is computed: a policy may ask for
+    /// anything, and what reaches the servo is clamped to what the bench allowed. `None` means
+    /// the file left that joint unbounded and only the single-turn register clamp applies.
+    pub limits: [Option<(f64, f64)>; NUM_JOINTS],
     /// Whether the IMU board answers on this bus, at [`IMU_DXL_ID`], after the servos.
     ///
     /// True for a robot with the board fitted; false makes the read one block shorter and
@@ -110,6 +130,8 @@ impl Default for FeetechConfig {
         Self {
             p_scale: 0.16,
             directions: [1.0; NUM_JOINTS],
+            zeros: [FACTORY_ZERO_RAW; NUM_JOINTS],
+            limits: [None; NUM_JOINTS],
             imu_on_bus: true,
         }
     }
@@ -118,9 +140,16 @@ impl Default for FeetechConfig {
 impl FeetechConfig {
     /// Build from the parameter file's plain values, refusing anything that is not ±1 — a
     /// direction of 0 would pin a joint at its zero, and 2 would double every angle.
+    ///
+    /// `zeros` and `limits` come from the calibration file when there is one, and are the
+    /// factory centre and unbounded otherwise. Both are checked here rather than trusted: a zero
+    /// outside a turn, or a limit pair upside down, would turn into motion that looks plausible
+    /// until the duck falls over.
     pub fn new(
         p_scale: f64,
         directions: &[i8],
+        zeros: [f64; NUM_JOINTS],
+        limits: [Option<(f64, f64)>; NUM_JOINTS],
         imu_on_bus: bool,
     ) -> std::result::Result<Self, String> {
         if directions.len() != NUM_JOINTS {
@@ -147,11 +176,40 @@ impl FeetechConfig {
                 }
             };
         }
+        for (i, &zero) in zeros.iter().enumerate() {
+            if !(zero.is_finite() && (0.0..=f64::from(RAW_MAX)).contains(&zero)) {
+                return Err(format!(
+                    "{} has zero_raw {zero}; a turn is 0..={RAW_MAX}",
+                    JOINT_NAMES[i]
+                ));
+            }
+        }
+        for (i, limit) in limits.iter().enumerate() {
+            let Some((lo, hi)) = limit else { continue };
+            if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+                return Err(format!(
+                    "{} has limits {lo}..{hi}; the low end must not be above the high end",
+                    JOINT_NAMES[i]
+                ));
+            }
+        }
         Ok(Self {
             p_scale,
             directions: out,
+            zeros,
+            limits,
             imu_on_bus,
         })
+    }
+
+    /// `rad`, clamped to what this joint is allowed to travel. The register clamp in
+    /// [`rad_to_raw`] is the last resort; this is the bench's limit, and the one a policy
+    /// should never be able to step over.
+    fn clamp(&self, joint: usize, rad: f64) -> f64 {
+        match self.limits[joint] {
+            Some((lo, hi)) => rad.clamp(lo, hi),
+            None => rad,
+        }
     }
 }
 
@@ -443,7 +501,11 @@ impl FeetechIo {
                 });
             }
             let raw = u16::from_le_bytes([block[0], block[1]]);
-            out[joint] = raw_to_rad(raw, self.config.directions[joint]);
+            out[joint] = raw_to_rad(
+                raw,
+                self.config.directions[joint],
+                self.config.zeros[joint],
+            );
         }
         Ok(out)
     }
@@ -525,20 +587,22 @@ fn sign_magnitude(raw: u16) -> i32 {
     }
 }
 
-/// Register count to model radians: 2048 is 0 rad, and `direction` says which way is positive.
+/// Register count to model radians: `zero_raw` is 0 rad, and `direction` says which way is
+/// positive.
 ///
-/// The same mapping as the XL330's — 4096 steps a turn, centre at 2048 — so
-/// [`crate::model::DEFAULT_POSITION`] means the same pose on both robots once each joint's
-/// zero has been calibrated to the straight-leg pose.
-fn raw_to_rad(raw: u16, direction: f64) -> f64 {
-    let centred = f64::from(sign_magnitude(raw)) - STEPS_PER_REV / 2.0;
+/// The same mapping as the XL330's — 4096 steps a turn — so [`crate::model::DEFAULT_POSITION`]
+/// means the same pose on both robots once each joint's zero has been calibrated to the
+/// straight-leg pose. Before calibration `zero_raw` is the middle of the turn, which is what the
+/// Dynamixel path assumes too.
+fn raw_to_rad(raw: u16, direction: f64, zero_raw: f64) -> f64 {
+    let centred = f64::from(sign_magnitude(raw)) - zero_raw;
     direction * centred * (2.0 * PI / STEPS_PER_REV)
 }
 
-/// Model radians to a register count, clamped to one turn. A target outside it would be
-/// read by the servo as a multi-turn move.
-fn rad_to_raw(rad: f64, direction: f64) -> u16 {
-    let raw = (direction * rad * (STEPS_PER_REV / (2.0 * PI)) + STEPS_PER_REV / 2.0).round();
+/// Model radians to a register count, clamped to one turn. A target outside it would be read by
+/// the servo as a multi-turn move.
+fn rad_to_raw(rad: f64, direction: f64, zero_raw: f64) -> u16 {
+    let raw = (direction * rad * (STEPS_PER_REV / (2.0 * PI)) + zero_raw).round();
     raw.clamp(0.0, f64::from(RAW_MAX)) as u16
 }
 
@@ -557,12 +621,17 @@ struct Feedback {
     temp_c: f64,
 }
 
-fn decode_block(block: &[u8], direction: f64, speed_steps_per_count: f64) -> Feedback {
+fn decode_block(
+    block: &[u8],
+    direction: f64,
+    zero_raw: f64,
+    speed_steps_per_count: f64,
+) -> Feedback {
     let position = u16::from_le_bytes([block[0], block[1]]);
     let speed = u16::from_le_bytes([block[2], block[3]]);
     let current = u16::from_le_bytes([block[13], block[14]]);
     Feedback {
-        position: raw_to_rad(position, direction),
+        position: raw_to_rad(position, direction, zero_raw),
         velocity: direction
             * f64::from(sign_magnitude(speed))
             * speed_steps_per_count
@@ -640,6 +709,7 @@ impl RobotIo for FeetechIo {
         }
 
         let mut temps_c = [0.0; NUM_JOINTS];
+        let mut joint_volts = [0.0; NUM_JOINTS];
         let mut volts = Vec::with_capacity(NUM_JOINTS);
         for (joint, block) in servo_blocks.iter().enumerate() {
             if block.len() != READ_LEN as usize {
@@ -652,14 +722,16 @@ impl RobotIo for FeetechIo {
             let fb = decode_block(
                 block,
                 self.config.directions[joint],
+                self.config.zeros[joint],
                 self.speed_steps_per_count,
             );
             sensors.positions[joint] = fb.position;
             sensors.velocities[joint] = fb.velocity;
             sensors.currents_ma[joint] = fb.current_ma;
             temps_c[joint] = fb.temp_c;
+            joint_volts[joint] = fb.volts;
             // A servo answering 0 V is answering nonsense; it must not drag the mean down as if
-            // the pack were half flat.
+            // the pack were half flat. The per-joint array keeps the zero as "did not say".
             if fb.volts > 0.0 {
                 volts.push(fb.volts);
             }
@@ -668,6 +740,7 @@ impl RobotIo for FeetechIo {
             self.last_slow = Some(SlowSensors {
                 volts: volts.iter().sum::<f64>() / volts.len() as f64,
                 temps_c,
+                joint_volts,
             });
         }
         Ok(sensors)
@@ -677,8 +750,19 @@ impl RobotIo for FeetechIo {
         let data: Vec<Vec<u8>> = targets
             .positions
             .iter()
-            .zip(&self.config.directions)
-            .map(|(&rad, &dir)| rad_to_raw(rad, dir).to_le_bytes().to_vec())
+            .enumerate()
+            .map(|(joint, &rad)| {
+                // The bench's limit applies before the register clamp: what the file allows is a
+                // fact about this body, and a policy asking past it is a policy that will fall.
+                let rad = self.config.clamp(joint, rad);
+                rad_to_raw(
+                    rad,
+                    self.config.directions[joint],
+                    self.config.zeros[joint],
+                )
+                .to_le_bytes()
+                .to_vec()
+            })
             .collect();
         self.controller
             .sync_write_raw_data(&JOINT_IDS, GOAL_POSITION_ADDR, &data)
@@ -748,6 +832,10 @@ impl RobotIo for FeetechIo {
     fn imu_stale(&self) -> ImuStale {
         self.stale_imu.stale
     }
+
+    fn cached_slow(&self) -> Option<SlowSensors> {
+        self.last_slow
+    }
 }
 
 #[cfg(test)]
@@ -758,12 +846,12 @@ mod tests {
     /// lets `DEFAULT_POSITION` be shared between the two robots.
     #[test]
     fn position_mapping_matches_the_dynamixel_bus() {
-        assert_eq!(raw_to_rad(2048, 1.0), 0.0);
-        assert!((raw_to_rad(3072, 1.0) - PI / 2.0).abs() < 1e-12);
-        assert!((raw_to_rad(1024, 1.0) + PI / 2.0).abs() < 1e-12);
+        assert_eq!(raw_to_rad(2048, 1.0, FACTORY_ZERO_RAW), 0.0);
+        assert!((raw_to_rad(3072, 1.0, FACTORY_ZERO_RAW) - PI / 2.0).abs() < 1e-12);
+        assert!((raw_to_rad(1024, 1.0, FACTORY_ZERO_RAW) + PI / 2.0).abs() < 1e-12);
         for raw in [0u16, 1, 1024, 2047, 2048, 2049, 3072, 4095] {
-            assert_eq!(rad_to_raw(raw_to_rad(raw, 1.0), 1.0), raw);
-            assert_eq!(rad_to_raw(raw_to_rad(raw, -1.0), -1.0), raw);
+            assert_eq!(rad_to_raw(raw_to_rad(raw, 1.0, FACTORY_ZERO_RAW), 1.0, FACTORY_ZERO_RAW), raw);
+            assert_eq!(rad_to_raw(raw_to_rad(raw, -1.0, FACTORY_ZERO_RAW), -1.0, FACTORY_ZERO_RAW), raw);
         }
     }
 
@@ -772,18 +860,18 @@ mod tests {
     #[test]
     fn a_reversed_joint_mirrors_about_the_centre() {
         let ten_degrees = 10.0_f64.to_radians();
-        let forward = rad_to_raw(ten_degrees, 1.0);
-        let reversed = rad_to_raw(ten_degrees, -1.0);
+        let forward = rad_to_raw(ten_degrees, 1.0, FACTORY_ZERO_RAW);
+        let reversed = rad_to_raw(ten_degrees, -1.0, FACTORY_ZERO_RAW);
         assert_eq!(i32::from(forward) - 2048, 2048 - i32::from(reversed));
-        assert!((raw_to_rad(reversed, -1.0) - ten_degrees).abs() < 2.0 * PI / STEPS_PER_REV);
+        assert!((raw_to_rad(reversed, -1.0, FACTORY_ZERO_RAW) - ten_degrees).abs() < 2.0 * PI / STEPS_PER_REV);
     }
 
     /// Targets past one turn are clamped rather than wrapped: the servo would take a wrapped
     /// value as a request to go the long way round.
     #[test]
     fn targets_outside_one_turn_are_clamped() {
-        assert_eq!(rad_to_raw(10.0, 1.0), 4095);
-        assert_eq!(rad_to_raw(-10.0, 1.0), 0);
+        assert_eq!(rad_to_raw(10.0, 1.0, FACTORY_ZERO_RAW), 4095);
+        assert_eq!(rad_to_raw(-10.0, 1.0, FACTORY_ZERO_RAW), 0);
     }
 
     /// Bit 15 is a sign, not a value bit. Read as plain `u16`, a slow reverse speed of 5
@@ -808,7 +896,7 @@ mod tests {
     /// Every field of the block lands where the register table says, in SI units.
     #[test]
     fn a_feedback_block_decodes_into_si_units() {
-        let fb = decode_block(&block(3072, 0x8000 | 100, 74, 36, 20), 1.0, 1.0);
+        let fb = decode_block(&block(3072, 0x8000 | 100, 74, 36, 20), 1.0, FACTORY_ZERO_RAW, 1.0);
         assert!((fb.position - PI / 2.0).abs() < 1e-12);
         assert!((fb.velocity + 100.0 * 2.0 * PI / 4096.0).abs() < 1e-12);
         assert!((fb.current_ma - 130.0).abs() < 1e-9);
@@ -820,8 +908,8 @@ mod tests {
     /// observed velocity opposes its observed motion, which a policy reads as a disturbance.
     #[test]
     fn direction_flips_velocity_with_position() {
-        let forward = decode_block(&block(2148, 100, 74, 30, 0), 1.0, 1.0);
-        let reversed = decode_block(&block(2148, 100, 74, 30, 0), -1.0, 1.0);
+        let forward = decode_block(&block(2148, 100, 74, 30, 0), 1.0, FACTORY_ZERO_RAW, 1.0);
+        let reversed = decode_block(&block(2148, 100, 74, 30, 0), -1.0, FACTORY_ZERO_RAW, 1.0);
         assert_eq!(forward.position, -reversed.position);
         assert_eq!(forward.velocity, -reversed.velocity);
     }
@@ -829,8 +917,8 @@ mod tests {
     /// With `phase` bit 2 clear a speed count is fifty steps a second, not one.
     #[test]
     fn the_coarse_speed_unit_is_fifty_times_the_fine_one() {
-        let fine = decode_block(&block(2048, 3, 74, 30, 0), 1.0, 1.0);
-        let coarse = decode_block(&block(2048, 3, 74, 30, 0), 1.0, 50.0);
+        let fine = decode_block(&block(2048, 3, 74, 30, 0), 1.0, FACTORY_ZERO_RAW, 1.0);
+        let coarse = decode_block(&block(2048, 3, 74, 30, 0), 1.0, FACTORY_ZERO_RAW, 50.0);
         assert!((coarse.velocity - 50.0 * fine.velocity).abs() < 1e-12);
     }
 
@@ -845,23 +933,79 @@ mod tests {
         assert_eq!(scale_gain(u16::MAX, 0.16), 254);
     }
 
+    /// The middle of a turn is where an uncalibrated joint reads 0 rad; a calibrated one reads
+    /// 0 rad at the count the bench measured, which is what makes `zero_raw` worth recording.
+    #[test]
+    fn a_calibrated_zero_moves_the_mapping() {
+        let zero = 2000.0;
+        assert_eq!(raw_to_rad(2000, 1.0, zero), 0.0);
+        assert!((raw_to_rad(3024, 1.0, zero) - PI / 2.0).abs() < 1e-12);
+        assert!((raw_to_rad(976, 1.0, zero) + PI / 2.0).abs() < 1e-12);
+        // And it round-trips, whatever the zero.
+        for raw in [0u16, 1, 976, 2000, 3024, 4095] {
+            assert_eq!(rad_to_raw(raw_to_rad(raw, 1.0, zero), 1.0, zero), raw);
+        }
+    }
+
     #[test]
     fn config_refuses_directions_that_are_not_plus_or_minus_one() {
+        let zeros = [FACTORY_ZERO_RAW; NUM_JOINTS];
+        let limits = [None; NUM_JOINTS];
         let mut d = [1i8; NUM_JOINTS];
-        assert!(FeetechConfig::new(0.16, &d, true).is_ok());
+        assert!(FeetechConfig::new(0.16, &d, zeros, limits, true).is_ok());
         d[3] = -1;
         assert_eq!(
-            FeetechConfig::new(0.16, &d, true).unwrap().directions[3],
+            FeetechConfig::new(0.16, &d, zeros, limits, true)
+                .unwrap()
+                .directions[3],
             -1.0
         );
         d[3] = 0;
-        assert!(FeetechConfig::new(0.16, &d, true).is_err());
-        assert!(FeetechConfig::new(0.16, &d[..14], true).is_err());
-        assert!(FeetechConfig::new(0.0, &[1i8; NUM_JOINTS], true).is_err());
+        assert!(FeetechConfig::new(0.16, &d, zeros, limits, true).is_err());
+        assert!(FeetechConfig::new(0.16, &d[..14], zeros, limits, true).is_err());
+        assert!(FeetechConfig::new(0.0, &[1i8; NUM_JOINTS], zeros, limits, true).is_err());
         // The presence of the IMU board is a parameter, not a validation: both settings build.
-        assert!(!FeetechConfig::new(0.16, &[1i8; NUM_JOINTS], false)
+        assert!(!FeetechConfig::new(0.16, &[1i8; NUM_JOINTS], zeros, limits, false)
             .unwrap()
             .imu_on_bus);
+    }
+
+    #[test]
+    fn config_refuses_a_zero_outside_a_turn_or_an_upside_down_limit() {
+        let mut zeros = [FACTORY_ZERO_RAW; NUM_JOINTS];
+        let limits = [None; NUM_JOINTS];
+        assert!(FeetechConfig::new(0.16, &[1i8; NUM_JOINTS], zeros, limits, true).is_ok());
+        zeros[5] = 5000.0;
+        let e = FeetechConfig::new(0.16, &[1i8; NUM_JOINTS], zeros, limits, true)
+            .expect_err("zero past a turn");
+        assert!(e.contains("zero_raw"), "{e}");
+        zeros[5] = FACTORY_ZERO_RAW;
+        let mut bad = [None; NUM_JOINTS];
+        bad[7] = Some((1.0, -1.0));
+        let e = FeetechConfig::new(0.16, &[1i8; NUM_JOINTS], zeros, bad, true)
+            .expect_err("low above high");
+        assert!(e.contains("limits"), "{e}");
+    }
+
+    /// The bench's limit is a fact about this body, so it applies before the register clamp:
+    /// a policy asking for 1 rad on a joint allowed ±0.1 gets 0.1, not the end of the turn.
+    #[test]
+    fn the_benchs_limit_clamps_before_the_register_clamp() {
+        let mut limits = [None; NUM_JOINTS];
+        limits[0] = Some((-0.1, 0.1));
+        let config = FeetechConfig::new(
+            0.16,
+            &[1i8; NUM_JOINTS],
+            [FACTORY_ZERO_RAW; NUM_JOINTS],
+            limits,
+            true,
+        )
+        .expect("valid");
+        assert_eq!(config.clamp(0, 1.0), 0.1);
+        assert_eq!(config.clamp(0, -1.0), -0.1);
+        assert_eq!(config.clamp(0, 0.05), 0.05);
+        // An unbounded joint is untouched.
+        assert_eq!(config.clamp(1, 3.0), 3.0);
     }
 
     /// The board answers under Feetech framing only when it is *last* in the request — a

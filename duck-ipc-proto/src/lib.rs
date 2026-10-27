@@ -711,6 +711,27 @@ pub mod method {
     /// where it is. Ends limp, ready for `robot.init`. Discrete; send as a request.
     pub const ROBOT_REST: &str = "robot.rest";
 
+    /// What the bus itself is doing, for a screen rather than for a policy.
+    ///
+    /// [`ROBOT_STATE`] answers "what is the robot doing"; this answers "what is the wire
+    /// doing" — per-joint voltage and temperature, when the sample was taken, whether every
+    /// servo answered, whether the IMU board is fresh, and which phase of commissioning the
+    /// daemon is in. The consumer is the Studio's battery card and calibration pages, which
+    /// poll it about once a second and read the per-joint numbers that `robot.state`
+    /// deliberately averages away.
+    ///
+    /// Deliberately **not** a stream: it is a poll, cheap on the daemon side, and the
+    /// calibration pages need it at 10 Hz only while somebody is watching a tilt.
+    pub const ROBOT_BUS_STATUS: &str = "robot.busStatus";
+
+    /// Ask the bus to do one commissioning thing, and wait for it to finish.
+    ///
+    /// The actions are the ones that need the wire to itself and a settled robot: read the
+    /// calibration file back, hold the stand pose so an IMU can be measured, and record the
+    /// IMU mounting once a person has confirmed the robot really is upright. Discrete; the
+    /// answer says what happened, or why not.
+    pub const ROBOT_BUS_COMMAND: &str = "robot.busCommand";
+
     // ── skills ───────────────────────────────────────────────────────────────
     //
     // One-shot scripted moves, ported from `microduck_runtime`. Each swaps a dedicated
@@ -1096,6 +1117,11 @@ pub enum Call {
     RobotRebootMotors(RebootMotorsParams),
     /// Sit, ease into the rest pose, then torque off and reboot. See [`method::ROBOT_REST`].
     RobotRest,
+    /// What the wire is doing: per-joint volts and temperatures, sample age, and the phase of
+    /// commissioning. See [`method::ROBOT_BUS_STATUS`].
+    RobotBusStatus,
+    /// One commissioning action that needs the bus to itself. See [`method::ROBOT_BUS_COMMAND`].
+    RobotBusCommand(BusCommandParams),
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
     /// Standing body pose. Continuous. Send as a notification.
@@ -1290,6 +1316,8 @@ impl Call {
             Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotRebootMotors(_) => method::ROBOT_REBOOT_MOTORS,
             Call::RobotRest => method::ROBOT_REST,
+            Call::RobotBusStatus => method::ROBOT_BUS_STATUS,
+            Call::RobotBusCommand(_) => method::ROBOT_BUS_COMMAND,
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
@@ -1490,6 +1518,7 @@ impl Call {
             | Call::RobotRelax
             | Call::RobotRebootMotors(_)
             | Call::RobotRest
+            | Call::RobotBusStatus
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
@@ -1501,6 +1530,9 @@ impl Call {
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
             | Call::RobotShutdown => (Robot, Prompt),
+            // A commissioning action waits for the wire: `hold-home` ramps fifteen joints over
+            // three seconds and `verify-imu` watches a tilt settle, so neither is a prompt.
+            Call::RobotBusCommand(_) => (Robot, Slow),
             Call::RobotSubscribe(_) => (Robot, Stream),
             // `btd` asking what to put on the air. The answering connection carries the beacon
             // stream down and `chorale.heard` notifications up.
@@ -1619,6 +1651,7 @@ impl Call {
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
+            Call::RobotBusCommand(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
             Call::SystemLogs(p) => encode(p),
@@ -1640,6 +1673,7 @@ impl Call {
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotRest
+            | Call::RobotBusStatus
             | Call::RobotShutdown
             | Call::RobotPolicies
             | Call::RobotModel
@@ -1715,6 +1749,8 @@ impl Call {
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
             method::CHORALE_HEARD => Call::ChoraleHeard(decode(params)?),
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
+            method::ROBOT_BUS_STATUS => Call::RobotBusStatus,
+            method::ROBOT_BUS_COMMAND => Call::RobotBusCommand(decode(params)?),
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
             method::ROBOT_POLICIES => Call::RobotPolicies,
@@ -1863,6 +1899,13 @@ pub mod test_support {
             Call::RobotRelax,
             Call::RobotRebootMotors(RebootMotorsParams { ids: vec![3, 11] }),
             Call::RobotRest,
+            Call::RobotBusStatus,
+            // One entry per method here: the other two `busCommand` actions share its method
+            // name and are exercised by their own serde tests rather than by this census.
+            Call::RobotBusCommand(BusCommandParams::HoldHome {
+                directions: vec![1; 15],
+                duration_ms: Some(3_000),
+            }),
             Call::RobotDo(DoParams {
                 skill: "ground_pick".into(),
             }),
@@ -2497,6 +2540,182 @@ pub struct DoParams {
     pub skill: Skill,
 }
 
+/// The answer to [`BusCommandParams::CalibrationStatus`].
+///
+/// Three views of the same file, because three different readers want different slices: the
+/// calibration pages want the raw document to diff against what they are about to write, the
+/// IMU page wants just the mounting, and both want to know which IMU the answer is about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusCalibration {
+    /// Which IMU the mounting below belongs to: `"bus"` for the board on the servo wire, or a
+    /// chip name for a head-mounted part.
+    pub imu_source: String,
+    /// The mounting, and whether a person has confirmed it.
+    pub imu_mount: BusImuMount,
+    /// The calibration document as this daemon parsed it, or `null` when no file was found.
+    ///
+    /// `null` rather than an error: a robot that has never been calibrated has to be able to
+    /// say so, and that is the state every freshly flashed robot is in.
+    pub calibration: Option<serde_json::Value>,
+    /// Where the file was looked for, so a page can say which path it is missing from.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BusImuMount {
+    /// `[w, x, y, z]`, sensor→body.
+    pub quat: [f64; 4],
+    pub verified: bool,
+}
+
+/// The answer to [`method::ROBOT_BUS_STATUS`].
+///
+/// `mode` and `phase` are the two words a client needs to decide what it may ask for: a robot
+/// in `commissioning` has no policy running and will hold poses on request, while a robot in
+/// `motion` with `phase == "control"` is being driven by one and must not be interrupted. The
+/// rest is diagnostics, split into the always-present summary and `native`, which is what the
+/// servos themselves said.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusStatus {
+    /// `"motion"` or `"commissioning"`. A startup constant in this daemon.
+    pub mode: String,
+    /// Where the daemon is in its life: the four startup phases, the commissioning phases, or
+    /// `"control"` once the loop is driving under a policy.
+    pub phase: String,
+    /// `"all_enabled"`, `"off"`, or `"unknown"` before the first bus transaction.
+    ///
+    /// `all_enabled` rather than a bare `"on"` because that is the distinction that matters: every
+    /// servo has confirmed its own torque bit, not merely that one was commanded. A client that
+    /// treats a command as a state will happily move a robot whose servos never answered.
+    pub torque_state: String,
+    /// Somebody asked for torque off and the servos have not confirmed it yet — the difference
+    /// between "cut power" and "the robot is limp", which is what an emergency stop has to know.
+    pub torque_off_pending: bool,
+    /// `[policy] enabled`: whether this robot has a policy at all, not whether one is loaded.
+    pub policy_enabled: bool,
+    /// What a `hold-home` is doing, when one is. `None` on a robot that was never asked to hold.
+    ///
+    /// Separate from `phase` because a hold outlives the command that started it: the bench asks
+    /// once and then watches this for as long as it needs the robot to stay put.
+    pub hold: Option<BusHold>,
+    /// The wire the servos speak: `"feetech-sts"` or `"dynamixel2"`.
+    pub backend: String,
+    /// What the servos and the IMU board last said.
+    pub native: BusNative,
+}
+
+/// The state of a `hold-home`, in the two words a bench needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusHold {
+    /// `"ramping"` while the pose is being approached, `"holding"` once it has arrived.
+    pub stage: String,
+    /// Worst joint error since the ramp finished, in degrees. `None` while still ramping — a
+    /// joint halfway home is not an error, it is a joint on its way.
+    pub max_error_deg: Option<f64>,
+}
+
+/// The measured half of [`BusStatus`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusNative {
+    /// Torque is on and every servo has confirmed it — not merely that it was commanded.
+    pub torque_state_confirmed: bool,
+    /// Every servo answered the last read, and that read is recent enough to act on.
+    pub feedback_fresh: bool,
+    /// Milliseconds since that read. `None` before the first one.
+    pub sample_age_ms: Option<f64>,
+    /// One entry per joint, in joint order.
+    pub joints: Vec<BusJoint>,
+    pub imu_ready: bool,
+    /// `"bus"` when the IMU is the board on the servo wire; absent when there is none.
+    pub imu_source: Option<String>,
+    pub imu_mount_verified: bool,
+    /// Which board, and how it identifies itself.
+    pub imu_bus: Option<BusImuBus>,
+    /// Reads that missed at least one servo since startup.
+    pub missing_total: u64,
+    /// Reads in a row that missed at least one servo.
+    pub consecutive_missing: u32,
+    /// Commands the robot clamped to a joint's measured travel.
+    pub command_clamps_total: u64,
+    /// Joint IDs that did not answer the last read.
+    pub stale_joint_ids: Vec<u8>,
+    /// Joint IDs currently being held at a commanded pose.
+    pub held_joint_ids: Vec<u8>,
+    /// The HD-1910 calibration state, as the bus layer reads it.
+    pub hd1910: BusHd1910,
+    /// Which policy files are loaded, keyed by slot, with the profile each one runs.
+    pub loaded_models: serde_json::Value,
+    /// The last sample itself, for a page drawing a live tilt or torque trace.
+    pub last_sample: Option<BusSample>,
+    /// Increments on every sample, so a client can tell a fresh answer from a repeated one.
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusJoint {
+    pub name: String,
+    pub id: u8,
+    /// `None` when this servo did not report one — not zero.
+    pub volts: Option<f64>,
+    pub temp_c: Option<f64>,
+    pub position_rad: Option<f64>,
+    pub current_ma: Option<f64>,
+    /// This joint answered the last read.
+    pub feedback_fresh: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusSample {
+    /// Milliseconds since `robotd` started, matching `robot.state`'s `t`.
+    pub at_ms: f64,
+    pub imu: Option<BusImuSample>,
+    /// Joint positions in radians, in joint order.
+    pub joints: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusImuSample {
+    /// The decoder accepted these bytes: finite, unit-length, not repeated beyond repair.
+    pub valid: bool,
+    pub source: String,
+    /// Downward gravity in the body frame, so a page can draw a bubble level.
+    pub gravity: [f64; 3],
+    pub quaternion_wxyz: [f64; 4],
+    /// How far the body is tilted from upright, in degrees.
+    pub tilt_deg: f64,
+    /// The decoder has seen enough samples to be trusted.
+    pub ready: bool,
+    pub age_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusImuBus {
+    /// `"feetech"` or `"dxl2"`: which framing the board answers.
+    pub protocol: String,
+    /// The board as it identifies itself, e.g. `"imu_to_dxl"`.
+    pub board: String,
+    /// Model and firmware words the board reports, in order.
+    pub identity: Vec<String>,
+}
+
+/// The Feetch HD-1910 calibration, as far as the wire can tell.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusHd1910 {
+    /// The calibration allows motion. False means the robot will hold a pose but not walk.
+    pub motion_enabled: bool,
+    /// All fifteen joints are calibrated, measured limits exist, and the mounting is verified.
+    pub calibration_complete: bool,
+    /// A torque-off the servos have not finished restoring gains after.
+    pub restore_pending: bool,
+    /// Gains were raised for a move and have not been put back yet.
+    pub temporary_gains_applied: bool,
+    pub imu_mount_verified: bool,
+    /// `"stiff"` or `"limp"`, as the current gain setting reads.
+    pub gain_mode: String,
+}
+
+
+
 /// Standing body pose offsets. Continuous intent — see [`method::ROBOT_POSE`].
 ///
 /// The trained ranges are small: z −0.025..+0.010 m, roll and pitch ±0.26 rad. The robot
@@ -2521,6 +2740,66 @@ impl Default for PoseParams {
             roll: 0.0,
             pitch: 0.0,
             active: true,
+        }
+    }
+}
+
+/// One commissioning action that needs the bus to itself — see [`method::ROBOT_BUS_COMMAND`].
+///
+/// Tagged by `action` because that is what the caller writes, and kebab-case because the
+/// calibration pages already spell them that way. `deny_unknown_fields` throughout: a caller
+/// that sends a field this daemon does not know is running a different protocol version and
+/// should be told, rather than have its extra field quietly ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BusCommandParams {
+    /// What the calibration file says, plus what the bus is measuring right now.
+    ///
+    /// The answer is a [`BusCalibration`] — the same document `robot.busStatus` reports under
+    /// `native.hd1910` and the file the bench wrote, so a page can show all three without the
+    /// caller having to reconcile two shapes.
+    CalibrationStatus,
+    /// Drive every joint to the pose the calibration calls home and hold it there.
+    ///
+    /// This is what makes a calibration possible at all: a robot standing under torque is the
+    /// only posture an IMU mounting can be measured against, and the policy is not running in
+    /// commissioning mode, so something has to hold the body up. The move is interpolated, not
+    /// snapped — fifteen joints jumping to home would throw the robot off the bench.
+    HoldHome {
+        /// One ±1 per joint, in joint order: which way each servo's positive rotation goes.
+        /// Sent by the page so the hold is performed against the calibration being written,
+        /// rather than against the one this daemon started with.
+        directions: Vec<i8>,
+        /// How long the ramp takes. Absent means [`BusCommandParams::DEFAULT_HOLD_MS`].
+        #[serde(default)]
+        duration_ms: Option<u32>,
+    },
+    /// Record the IMU mounting, once a person has confirmed the robot really is upright.
+    ///
+    /// Written to the calibration file — the daemon does not own that file, but this is the one
+    /// field it has the measurement for, and a page that had to write TOML itself would have to
+    /// reimplement the format. Absent file, or one that will not parse: refused with the reason,
+    /// because a mount recorded into nothing is a mount nobody will read.
+    VerifyImu {
+        /// The person pressed the button. Without this the call is refused: the measurement is
+        /// only meaningful against a human's word that the robot is standing upright, and that
+        /// is exactly what cannot be measured from inside the robot.
+        confirmed: bool,
+        /// The mounting quaternion `[w, x, y, z]`, sensor→body.
+        mount_wxyz: [f64; 4],
+    },
+}
+
+impl BusCommandParams {
+    /// Default ramp for [`BusCommandParams::HoldHome`], matching the calibration pages.
+    pub const DEFAULT_HOLD_MS: u32 = 3_000;
+
+    /// The `action` string, for logging.
+    pub fn action(&self) -> &'static str {
+        match self {
+            Self::CalibrationStatus => "calibration-status",
+            Self::HoldHome { .. } => "hold-home",
+            Self::VerifyImu { .. } => "verify-imu",
         }
     }
 }
@@ -5827,7 +6106,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            73,
+            75,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

@@ -48,10 +48,14 @@ port = "/dev/ttyS2"
 # onto the servo's one-byte P; directions is +1/-1 per joint (left leg, neck/head/mouth, right
 # leg), measured on the robot. imu says the imu_to_dxl board answers on this bus too (ID 200,
 # last in the read): false for a bus with no board, which runs the robot without a policy.
+# calibration is the file the bench writes joint zeros and limits into and `robotd` writes the
+# IMU mount into; a missing or unreadable file is a warning, not a refused start, because a
+# robot with a broken calibration still has to be able to stand up and be recalibrated.
 # [bus.feetech]
 # p_scale = 0.16
 # directions = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 # imu = true
+# calibration = "/etc/robot/feetech-ft5/hd1910-calibration.toml"
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
