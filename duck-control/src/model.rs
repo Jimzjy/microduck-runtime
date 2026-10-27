@@ -96,8 +96,13 @@ pub fn mouth_target(open: f64) -> f64 {
     MOUTH_CLOSED + open * (MOUTH_OPEN - MOUTH_CLOSED)
 }
 
-/// The `imu_to_dxl` v2 board's Dynamixel ID. It rides the motor bus and is read in the
-/// same transaction as the servos ([`crate::bus`]).
+/// The `imu_to_dxl` board's bus ID. It rides the motor bus and is read in the same
+/// transaction as the servos ([`crate::bus`]).
+///
+/// The same board answers to this ID under *both* protocols: Dynamixel Protocol 2 on a
+/// Dynamixel bus, and Feetech framing when the daemon drives the bus as Feetech — its
+/// firmware implements the Feetech register table for exactly that reason, with the same
+/// 15-byte fast block at 56 ([`crate::bus_feetech`]).
 pub const IMU_DXL_ID: u8 = 200;
 
 pub const BAUD_RATE: u32 = 1_000_000;

@@ -46,10 +46,12 @@ port = "/dev/ttyS2"
 
 # Feetech builds only. p_scale maps the XL330-scale gains used everywhere else in this file
 # onto the servo's one-byte P; directions is +1/-1 per joint (left leg, neck/head/mouth, right
-# leg), measured on the robot.
+# leg), measured on the robot. imu says the imu_to_dxl board answers on this bus too (ID 200,
+# last in the read): false for a bus with no board, which runs the robot without a policy.
 # [bus.feetech]
 # p_scale = 0.16
 # directions = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+# imu = true
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to

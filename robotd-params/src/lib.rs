@@ -2355,6 +2355,13 @@ pub struct BusFeetech {
     /// +1 or -1 per joint, in joint order (left leg, neck/head/mouth, right leg): whether the
     /// servo's increasing count is the model's positive rotation.
     pub directions: Vec<i8>,
+    /// Whether the `imu_to_dxl` board answers on this bus, at ID 200, after the servos.
+    ///
+    /// Its firmware serves the Feetech register table as well as Dynamixel Protocol 2, so the
+    /// fast block that carries orientation rides the same sync read as the servos. False is for
+    /// a bus with no board fitted: the read is one block shorter, and the daemon runs without a
+    /// policy — the same thing it does on a Dynamixel bus whose board does not answer.
+    pub imu: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2436,6 +2443,7 @@ impl Default for BusFeetech {
         Self {
             p_scale: 0.16,
             directions: vec![1; 15],
+            imu: true,
         }
     }
 }

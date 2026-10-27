@@ -1464,12 +1464,14 @@ fn open_bus(
             return None;
         }
     };
-    // Dynamixel-only bring-up steps: the IMU mount and replacement adoption are properties of
-    // the Pollen bus. A Feetech build has no IMU on the wire (imu_ready stays false, so the
-    // policy and fall detection stay off) and its servo IDs are set by the bench rig — there
-    // is nothing to adopt and no mount to hand the decoder.
+    // The mounting of the IMU board is a property of the body, not of the wire: the same
+    // `imu_to_dxl` board answers on either bus, so both protocols get the mount. Whether the
+    // board is expected at all is `[bus.feetech] imu` on the Feetech arm, and always on the
+    // Dynamixel one.
+    io.set_imu_mount(body_imu_mount(board));
+    // Dynamixel-only bring-up step: replacement adoption is a property of the Pollen bus. On
+    // Feetech the servo IDs are set by the bench rig, so there is nothing to adopt.
     if matches!(protocol, BusProtocol::Dynamixel2) {
-        io.set_imu_mount(body_imu_mount(board));
         // Under the same `loud` rule as everything else here — a board waiting on servo power
         // retries this forever. Worth saying at all because the whole tick budget hangs off it,
         // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
@@ -1552,6 +1554,7 @@ fn bus_protocol(bus: &params::Bus) -> Result<BusProtocol, String> {
         params::BusProtocol::FeetechSts => BusProtocol::FeetechSts(FeetechConfig::new(
             bus.feetech.p_scale,
             &bus.feetech.directions,
+            bus.feetech.imu,
         )?),
     })
 }

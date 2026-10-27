@@ -123,8 +123,10 @@ pub const REGISTRY: &[Entry] = &[
     ),
     entry(
         "bus.feetech",
-        Kind::Record("p_scale = 0.16\ndirections = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]"),
-        "Feetech build only: gain scale and per-joint direction, measured on the bench — edit robotd.toml by hand",
+        Kind::Record(
+            "p_scale = 0.16\ndirections = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\nimu = true",
+        ),
+        "Feetech build only: gain scale and per-joint direction, measured on the bench; imu says whether the board answers at ID 200 — edit robotd.toml by hand",
     ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),

@@ -73,26 +73,23 @@ impl AnyBus {
         }
     }
 
-    /// Which way the IMU board hangs off the bus (Dynamixel wiring only).
+    /// Which way the IMU board hangs off the bus.
     ///
-    /// A Feetech build has no `imu_to_dxl` board on the wire, so there is no mount to tell the
-    /// decoder about; the flag is kept anyway so the daemon code does not branch on protocol.
+    /// The same `imu_to_dxl` board serves both protocols, so both arms take the mount. On the
+    /// Feetech arm it only reaches the decoder; whether the board is expected at all is
+    /// `[bus.feetech] imu`, so the daemon code never branches on protocol.
     pub fn set_imu_mount(&mut self, mount: [f64; 4]) {
-        if let Self::Dynamixel(io) = self {
-            io.set_imu_mount(mount);
-        }
+        each!(self, io => io.set_imu_mount(mount))
     }
 
     /// Does the IMU board answer a ping?
     ///
-    /// The Feetech arm answers `true` without touching the wire: there is no IMU board to wait
-    /// for, and startup must not stall on one. [`RobotIo::imu_ready`] is what turns the policy
-    /// and fall detection off for that backend.
+    /// Both arms ask the wire and report what came back, except the Feetech arm with
+    /// `[bus.feetech] imu = false`, which has no board to wait for and says so. `false` is not
+    /// fatal: startup waits a while, then goes on without a policy, and [`RobotIo::imu_ready`]
+    /// keeps saying so.
     pub fn imu_answers(&mut self) -> Result<bool> {
-        match self {
-            Self::Dynamixel(io) => io.imu_answers(),
-            Self::Feetech(_) => Ok(true),
-        }
+        each!(self, io => io.imu_answers())
     }
 
     pub fn check_registers(&mut self) -> Result<usize> {

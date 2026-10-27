@@ -43,6 +43,24 @@ the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip 
 quaternion out of the same register block the servos answer at. One board, one code path, no
 IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
 
+**A second wire speaks the same board, and there the order is reversed.**
+`[bus] protocol = "feetech-sts"` puts HD-1910 servos on the same port
+(`duck_control::bus_feetech::FeetechIo`). The board carries the Feetech register table as well
+as protocol 2, so it still answers `id 200` with an SFLP quaternion — out of a 15-byte fast
+block at 56 rather than 124, whose first 12 bytes are the same block, which is why
+`SflpDecoder` is shared rather than written twice. Two consequences worth knowing:
+
+- **It is requested last, not first.** The Feetech sync read is not one appended packet; each
+  device answers in turn, and measured on the bench a non-servo block ahead of a servo makes
+  the servo's answer run a byte early, after which the board's checksum eats the next block's
+  first byte. Middle or end is reliable; first is not.
+- **Whether it is expected at all is a parameter**: `[bus.feetech] imu`. `false` reads one
+  block fewer and leaves `imu_ready()` false, so the daemon comes up and reports, without a
+  policy — the same state a Dynamixel bus is in when the board does not answer.
+
+The gain scale, the per-joint directions and the EEPROM-lock reasoning are the Feetech
+backend's own; `duck-control/src/bus_feetech.rs` is the reference for those.
+
 **One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
 motor control needs the character devices, and root is not stopped by that flag. The daemon

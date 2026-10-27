@@ -17,9 +17,13 @@
 //! - **The sign of a joint is not a given.** On the XL330 robot the horn orientation fixes the
 //!   positive direction and it matches the model. With different servos in remodelled parts
 //!   that has to be measured per joint, so it is a parameter: [`FeetechConfig::directions`].
-//! - **There is no IMU on this bus.** The `imu_to_dxl` board speaks Dynamixel Protocol 2; until
-//!   a Feetech-speaking IMU source exists this backend reports the default orientation and
-//!   says, through [`RobotIo::imu_ready`], that it is not a measurement.
+//! - **The IMU board answers here too, at ID 200, and last.** The `imu_to_dxl` board's
+//!   firmware carries the Feetech register table as well as Dynamixel Protocol 2, and serves
+//!   the same 15-byte fast block at 56 — so the one sync read that collects the servos also
+//!   collects orientation, no second transaction. It must be requested **after** the servos:
+//!   measured on the bench, a non-servo block ahead of a servo makes the servo's answer run a
+//!   byte early and the board's checksum then eats the next block's first byte. Whether the
+//!   board is expected at all is [`FeetechConfig::imu_on_bus`].
 //!
 //! Register addresses and semantics are from Feetech's *磁编码 STS 内存表* v1.1 (2026-08-27) and
 //! *SCS 通信协议* v1.0 (2026-06-09); `rustypot`'s `sts3215` table agrees with them.
@@ -29,10 +33,11 @@ use std::time::Duration;
 
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
 
-use crate::imu::ImuData;
-use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+use crate::bus::{StaleImuTracker, STALE_RUN_WARN};
+use crate::imu::{ImuData, SflpDecoder, IMU_BLOCK_LEN};
+use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
-    BAUD_RATE, FACTORY_ID, FEETECH_EXPECTED_MODE, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
+    BAUD_RATE, FACTORY_ID, FEETECH_EXPECTED_MODE, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
 };
 
 /// What `rustypot` returns. Its own alias is private, so it is spelled out here.
@@ -91,6 +96,13 @@ pub struct FeetechConfig {
     /// +1 or −1 per joint, indexed as [`JOINT_NAMES`]: whether the servo's increasing count is
     /// the model's positive rotation. Measured on the robot, not derived.
     pub directions: [f64; NUM_JOINTS],
+    /// Whether the IMU board answers on this bus, at [`IMU_DXL_ID`], after the servos.
+    ///
+    /// True for a robot with the board fitted; false makes the read one block shorter and
+    /// leaves [`RobotIo::imu_ready`] false, which is what the daemon already does when it
+    /// starts on a bus with no IMU. Not a compile-time choice: the same binary drives a robot
+    /// with the board and one without.
+    pub imu_on_bus: bool,
 }
 
 impl Default for FeetechConfig {
@@ -98,6 +110,7 @@ impl Default for FeetechConfig {
         Self {
             p_scale: 0.16,
             directions: [1.0; NUM_JOINTS],
+            imu_on_bus: true,
         }
     }
 }
@@ -105,7 +118,11 @@ impl Default for FeetechConfig {
 impl FeetechConfig {
     /// Build from the parameter file's plain values, refusing anything that is not ±1 — a
     /// direction of 0 would pin a joint at its zero, and 2 would double every angle.
-    pub fn new(p_scale: f64, directions: &[i8]) -> std::result::Result<Self, String> {
+    pub fn new(
+        p_scale: f64,
+        directions: &[i8],
+        imu_on_bus: bool,
+    ) -> std::result::Result<Self, String> {
         if directions.len() != NUM_JOINTS {
             return Err(format!(
                 "bus.feetech.directions has {} entries, expected {NUM_JOINTS}",
@@ -133,6 +150,7 @@ impl FeetechConfig {
         Ok(Self {
             p_scale,
             directions: out,
+            imu_on_bus,
         })
     }
 }
@@ -145,16 +163,56 @@ pub struct FeetechIo {
     speed_steps_per_count: f64,
     /// Voltage and temperatures from the last tick's block, so `slow_sensors` is free.
     last_slow: Option<SlowSensors>,
+    /// The IDs one sync read asks for, in the order the blocks come back: the servos in
+    /// [`JOINT_IDS`] order, then the IMU board. The board must be last — see the module doc.
+    ids: Vec<u8>,
+    /// Orientation, from the board's SFLP table. The mount is a property of how the board is
+    /// screwed to the body, so it arrives after `open`.
+    imu: SflpDecoder,
+    /// Counts reads in which the board answered without refreshing.
+    stale_imu: StaleImuTracker,
 }
 
 impl FeetechIo {
     pub fn open(port: &str, config: FeetechConfig) -> Result<Self> {
+        let ids = read_ids(config.imu_on_bus);
         Ok(Self {
             controller: open_controller(port, BAUD_RATE)?,
             config,
             speed_steps_per_count: 1.0,
             last_slow: None,
+            ids,
+            imu: SflpDecoder::new(SflpDecoder::DEFAULT_MOUNT),
+            stale_imu: StaleImuTracker::default(),
         })
+    }
+
+    /// Which way the IMU board hangs off the bus, relative to the model's frame.
+    ///
+    /// The board reports the raw chip frame; the daemon hands in the mounting rotation once at
+    /// startup ([`crate::imu::SflpDecoder::DEFAULT_MOUNT`] for a Zero 3W). Called whether or not
+    /// the board is expected, so the mounting stays a one-line fact in one place.
+    pub fn set_imu_mount(&mut self, mount: [f64; 4]) {
+        self.imu = SflpDecoder::new(mount);
+    }
+
+    /// Does the IMU board answer a ping?
+    ///
+    /// `true` when the parameter file says there is no board: there is nothing to wait for, and
+    /// startup must not stall on a device the robot does not have. [`RobotIo::imu_ready`] is
+    /// what keeps the policy and fall detection off in that case, so the daemon comes up and
+    /// reports, rather than waiting forever for a board that was never fitted.
+    ///
+    /// When a board *is* expected, the ping is what tells an absent board from one that has not
+    /// been asked yet — the answer decides whether startup waits.
+    pub fn imu_answers(&mut self) -> Result<bool> {
+        if !self.config.imu_on_bus {
+            return Ok(true);
+        }
+        self.controller
+            .ping(IMU_DXL_ID)
+            .map(|_| true)
+            .map_err(|e| IoError::Bus(format!("ping imu board {IMU_DXL_ID}: {e}")))
     }
 
     /// Assert the registers the control loop depends on, and correct the one that is safe to.
@@ -515,16 +573,28 @@ fn decode_block(block: &[u8], direction: f64, speed_steps_per_count: f64) -> Fee
     }
 }
 
+/// The IDs one sync read asks for: the servos in [`JOINT_IDS`] order, then the IMU board.
+///
+/// The board being last is a requirement of its firmware, not a preference — see the module
+/// doc for what a non-servo block ahead of a servo does to the answer.
+fn read_ids(imu_on_bus: bool) -> Vec<u8> {
+    let mut ids = JOINT_IDS.to_vec();
+    if imu_on_bus {
+        ids.push(IMU_DXL_ID);
+    }
+    ids
+}
+
 impl RobotIo for FeetechIo {
     fn read(&mut self) -> Result<Sensors> {
         let blocks = self
             .controller
-            .sync_read_raw_data(&JOINT_IDS, READ_ADDR, READ_LEN)
+            .sync_read_raw_data(&self.ids, READ_ADDR, READ_LEN)
             .map_err(|e| IoError::Bus(format!("motor sync_read: {e}")))?;
-        if blocks.len() != NUM_JOINTS {
+        if blocks.len() != self.ids.len() {
             return Err(IoError::ShortRead {
                 what: "sync_read blocks",
-                expected: NUM_JOINTS,
+                expected: self.ids.len(),
                 got: blocks.len(),
             });
         }
@@ -533,9 +603,45 @@ impl RobotIo for FeetechIo {
             imu: ImuData::default(),
             ..Sensors::default()
         };
+
+        // The servo blocks come first, the IMU board last, in request order.
+        let (servo_blocks, imu_block) = if self.config.imu_on_bus {
+            let (servos, board) = blocks.split_at(NUM_JOINTS);
+            (servos, Some(&board[0]))
+        } else {
+            (&blocks[..], None)
+        };
+
+        if let Some(block) = imu_block {
+            // The board's fast block is 15 bytes — gyro, quaternion x/y/z, sample counter,
+            // status, reserved — and the decoder wants the first 12, exactly the 12 a
+            // Dynamixel read of the same board returns (w is derived from x/y/z either way).
+            if block.len() < IMU_BLOCK_LEN {
+                return Err(IoError::ShortRead {
+                    what: "imu block",
+                    expected: IMU_BLOCK_LEN,
+                    got: block.len(),
+                });
+            }
+            let mut raw = [0u8; IMU_BLOCK_LEN];
+            raw.copy_from_slice(&block[..IMU_BLOCK_LEN]);
+            // Say so, or the counters are numbers nobody ever reads — but only once the run is
+            // long enough to mean something, and rate-limited past that because a board that has
+            // stopped refreshing produces one of these every tick.
+            let run = self.stale_imu.observe(&raw);
+            if run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)) {
+                tracing::warn!(
+                    consecutive = run,
+                    total = self.stale_imu.stale.total,
+                    "imu board has returned the same sample {run} reads running — orientation is frozen"
+                );
+            }
+            sensors.imu = self.imu.decode(&raw);
+        }
+
         let mut temps_c = [0.0; NUM_JOINTS];
         let mut volts = Vec::with_capacity(NUM_JOINTS);
-        for (joint, block) in blocks.iter().enumerate() {
+        for (joint, block) in servo_blocks.iter().enumerate() {
             if block.len() != READ_LEN as usize {
                 return Err(IoError::ShortRead {
                     what: "motor block",
@@ -628,10 +734,19 @@ impl RobotIo for FeetechIo {
         })
     }
 
-    /// No IMU on this bus yet: the orientation in [`Sensors`] is the upright default, and this
-    /// is what tells the rest of the daemon not to treat it as a measurement.
+    /// Whether the orientation in [`Sensors`] is a measurement.
+    ///
+    /// Two conditions, and both matter: the board has to be on the bus at all, and it has to
+    /// have sent enough samples for the filter to have settled (the same 25 the Dynamixel bus
+    /// waits for). Until then the policy and fall detection stay off — which is why a bus with
+    /// no board does not walk.
     fn imu_ready(&self) -> bool {
-        false
+        self.config.imu_on_bus && self.imu.ready()
+    }
+
+    /// Reads in which the board answered with a block identical to the one before.
+    fn imu_stale(&self) -> ImuStale {
+        self.stale_imu.stale
     }
 }
 
@@ -733,12 +848,72 @@ mod tests {
     #[test]
     fn config_refuses_directions_that_are_not_plus_or_minus_one() {
         let mut d = [1i8; NUM_JOINTS];
-        assert!(FeetechConfig::new(0.16, &d).is_ok());
+        assert!(FeetechConfig::new(0.16, &d, true).is_ok());
         d[3] = -1;
-        assert_eq!(FeetechConfig::new(0.16, &d).unwrap().directions[3], -1.0);
+        assert_eq!(
+            FeetechConfig::new(0.16, &d, true).unwrap().directions[3],
+            -1.0
+        );
         d[3] = 0;
-        assert!(FeetechConfig::new(0.16, &d).is_err());
-        assert!(FeetechConfig::new(0.16, &d[..14]).is_err());
-        assert!(FeetechConfig::new(0.0, &[1i8; NUM_JOINTS]).is_err());
+        assert!(FeetechConfig::new(0.16, &d, true).is_err());
+        assert!(FeetechConfig::new(0.16, &d[..14], true).is_err());
+        assert!(FeetechConfig::new(0.0, &[1i8; NUM_JOINTS], true).is_err());
+        // The presence of the IMU board is a parameter, not a validation: both settings build.
+        assert!(!FeetechConfig::new(0.16, &[1i8; NUM_JOINTS], false)
+            .unwrap()
+            .imu_on_bus);
+    }
+
+    /// The board answers under Feetech framing only when it is *last* in the request — a
+    /// non-servo block ahead of a servo makes the servo's answer run a byte early (measured on
+    /// the bench). So the ID list is servo order, then 200, and this test is the guard on it.
+    #[test]
+    fn the_imu_board_is_read_after_the_servos() {
+        let with = read_ids(true);
+        assert_eq!(with.len(), NUM_JOINTS + 1);
+        assert_eq!(&with[..NUM_JOINTS], &JOINT_IDS[..]);
+        assert_eq!(with[NUM_JOINTS], IMU_DXL_ID);
+
+        let without = read_ids(false);
+        assert_eq!(without.len(), NUM_JOINTS);
+        assert_eq!(&without[..], &JOINT_IDS[..]);
+        assert!(!without.contains(&IMU_DXL_ID));
+    }
+
+    /// The board's 15-byte fast block puts the SFLP quaternion (x/y/z, half precision, w
+    /// derived) in bytes 6–11 — the same 12 bytes a Dynamixel read of the same board returns,
+    /// which is why the decoder is shared rather than written twice.
+    #[test]
+    fn the_feetech_imu_block_decodes_as_the_shared_sflp_block() {
+        let mut block = [0u8; IMU_BLOCK_LEN];
+        // q = (0, 0, 1) as three half-precision values: 0.0, 0.0, 1.0 (0x3C00).
+        block[6..12].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x3C]);
+        let mut imu = SflpDecoder::new(SflpDecoder::DEFAULT_MOUNT);
+        assert!(!imu.ready(), "one sample is not a settled orientation");
+        let mut data = ImuData::default();
+        for _ in 0..25 {
+            data = imu.decode(&block);
+        }
+        assert!(imu.ready());
+        assert!(data.quat.iter().all(|v| v.is_finite()));
+        let norm = data.quat.iter().map(|v| v * v).sum::<f64>();
+        assert!((norm - 1.0).abs() < 1e-9, "quaternion must stay unit length");
+    }
+
+    /// A board that answers without refreshing is a frozen orientation, not a quiet robot, and
+    /// it is the one fault nothing else reports. The tracker is the same one the Dynamixel bus
+    /// uses, so this only checks that the Feetech path feeds it.
+    #[test]
+    fn a_repeating_block_is_counted_as_stale() {
+        let mut tracker = StaleImuTracker::default();
+        let block = [7u8; IMU_BLOCK_LEN];
+        assert_eq!(tracker.observe(&block), 0, "the first block cannot be stale");
+        assert_eq!(tracker.observe(&block), 1);
+        assert_eq!(tracker.observe(&block), 2);
+        let mut other = block;
+        other[0] = 8;
+        assert_eq!(tracker.observe(&other), 0, "a fresh block ends the run");
+        assert_eq!(tracker.stale.total, 2, "the total never resets");
+        assert_eq!(tracker.stale.run, 0);
     }
 }
