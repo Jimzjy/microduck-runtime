@@ -1279,13 +1279,10 @@ fn spawn_control_thread(
             // afterwards. Retrying the read alone was not enough: execution never got there.
             // Refused here rather than retried: a direction list of the wrong length does not
             // fix itself, and waiting on it would read as "servo power is off".
-            let protocol = match bus_protocol(&params.bus) {
-                Ok(protocol) => protocol,
-                Err(e) => {
-                    tracing::error!(error = %e, "invalid [bus] parameters; no control loop");
-                    return;
-                }
-            };
+            if let Err(e) = bus_protocol(&params.bus) {
+                tracing::error!(error = %e, "invalid [bus] parameters; no control loop");
+                return;
+            }
             runtime.block_on(async move {
                 // The voice works while the bus does not: a robot waiting on unplugged servos
                 // still quacks. Stopped before the loop starts, which then owns the speaker.
@@ -1458,7 +1455,7 @@ fn open_bus(
             return None;
         }
     };
-    let mut io = match BusIo::open(port, &protocol) {
+    let mut io = match BusIo::open(port, &protocol, bus.fast_sync_read) {
         Ok(io) => io,
         Err(e) => {
             if loud {

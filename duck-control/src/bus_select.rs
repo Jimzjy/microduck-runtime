@@ -55,9 +55,11 @@ macro_rules! each {
 }
 
 impl AnyBus {
-    pub fn open(port: &str, protocol: &BusProtocol) -> Result<Self> {
+    pub fn open(port: &str, protocol: &BusProtocol, fast_sync_read: bool) -> Result<Self> {
         Ok(match protocol {
-            BusProtocol::Dynamixel2 => Self::Dynamixel(DynamixelIo::open(port)?),
+            BusProtocol::Dynamixel2 => {
+                Self::Dynamixel(DynamixelIo::open(port, fast_sync_read)?)
+            }
             BusProtocol::FeetechSts(config) => {
                 Self::Feetech(FeetechIo::open(port, config.clone())?)
             }
@@ -68,6 +70,28 @@ impl AnyBus {
         match self {
             Self::Dynamixel(_) => BusProtocol::DYNAMIXEL2,
             Self::Feetech(_) => BusProtocol::FEETECH_STS,
+        }
+    }
+
+    /// Which way the IMU board hangs off the bus (Dynamixel wiring only).
+    ///
+    /// A Feetech build has no `imu_to_dxl` board on the wire, so there is no mount to tell the
+    /// decoder about; the flag is kept anyway so the daemon code does not branch on protocol.
+    pub fn set_imu_mount(&mut self, mount: [f64; 4]) {
+        if let Self::Dynamixel(io) = self {
+            io.set_imu_mount(mount);
+        }
+    }
+
+    /// Does the IMU board answer a ping?
+    ///
+    /// The Feetech arm answers `true` without touching the wire: there is no IMU board to wait
+    /// for, and startup must not stall on one. [`RobotIo::imu_ready`] is what turns the policy
+    /// and fall detection off for that backend.
+    pub fn imu_answers(&mut self) -> Result<bool> {
+        match self {
+            Self::Dynamixel(io) => io.imu_answers(),
+            Self::Feetech(_) => Ok(true),
         }
     }
 
