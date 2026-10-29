@@ -2631,6 +2631,11 @@ pub struct BusNative {
     pub imu_mount_verified: bool,
     /// Which board, and how it identifies itself.
     pub imu_bus: Option<BusImuBus>,
+    /// IMU decoder generation the configuration asks for: `"legacy"` or `"qinmo"`.
+    /// We only ship legacy; stating it explicitly keeps newer Studio builds from
+    /// having to infer the profile from absent fields.
+    #[serde(default)]
+    pub configured_imu_profile: Option<String>,
     /// Reads that missed at least one servo since startup.
     pub missing_total: u64,
     /// Reads in a row that missed at least one servo.
@@ -2696,6 +2701,11 @@ pub struct BusImuBus {
     pub board: String,
     /// Model and firmware words the board reports, in order.
     pub identity: Vec<String>,
+    /// IMU decoder generation: `"legacy"` (SFLP block) or `"qinmo"`. We only
+    /// speak legacy; naming the field keeps newer Studio builds from treating
+    /// its absence as an unsupported mixed report.
+    #[serde(default)]
+    pub profile: String,
 }
 
 /// The Feetch HD-1910 calibration, as far as the wire can tell.
