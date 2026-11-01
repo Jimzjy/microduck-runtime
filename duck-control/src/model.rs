@@ -105,7 +105,11 @@ pub fn mouth_target(open: f64) -> f64 {
 /// 15-byte fast block at 56 ([`crate::bus_feetech`]).
 pub const IMU_DXL_ID: u8 = 200;
 
-pub const BAUD_RATE: u32 = 1_000_000;
+/// Bus speed. The A733 clocks uart2 from a fixed 24 MHz (`sys24M -> apb-uart -> uart2`) and
+/// the vendor `uart-ng` driver has no fractional divisor, so 1 Mbps divides down to 750 kbps
+/// in hardware and nothing on the bus answers. 500 kbps divides exactly
+/// (`24 MHz / 16 / 3`) and is a first-class Feetech rate (register 6 = 1).
+pub const BAUD_RATE: u32 = 500_000;
 
 /// What a servo answers as out of the box: ID 1 at 57 600 baud. Both are deliberately unused
 /// on this bus — no joint is ID 1 and nothing runs at that speed — which is what lets a
@@ -161,6 +165,10 @@ pub fn homing_offset(id: u8) -> i32 {
 /// commanding a fresh target every tick wants. Mode 0 is the ordinary position servo. Checked
 /// and reported at startup, never written — see [`crate::bus_feetech::FeetechIo::check_registers`].
 pub const FEETECH_EXPECTED_MODE: u8 = 4;
+
+/// Register 6 (`baudrate`) value on the STS/SMS family that matches [`BAUD_RATE`]:
+/// 1 = 500 kbps (`0` would be 1 Mbps, `2` = 250 kbps).
+pub const FEETECH_BAUD_REGISTER: u8 = 1;
 
 /// Index of a joint by name. Linear scan over 15 entries, used at startup and in tests.
 pub fn joint_index(name: &str) -> Option<usize> {

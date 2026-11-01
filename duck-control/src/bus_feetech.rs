@@ -37,7 +37,8 @@ use crate::bus::{StaleImuTracker, STALE_RUN_WARN};
 use crate::imu::{ImuData, SflpDecoder, IMU_BLOCK_LEN};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
-    BAUD_RATE, FACTORY_ID, FEETECH_EXPECTED_MODE, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
+    BAUD_RATE, FACTORY_ID, FEETECH_BAUD_REGISTER, FEETECH_EXPECTED_MODE, IMU_DXL_ID, JOINT_IDS,
+    JOINT_NAMES, NUM_JOINTS,
 };
 
 /// What `rustypot` returns. Its own alias is private, so it is spelled out here.
@@ -343,14 +344,14 @@ impl FeetechIo {
 
         let mut fixed = 0;
         let baud = first(self.controller.read_baudrate(id), "baudrate", id)?;
-        if baud != 0 {
+        if baud != FEETECH_BAUD_REGISTER {
             tracing::warn!(
                 id,
                 got = baud,
-                want = 0,
+                want = FEETECH_BAUD_REGISTER,
                 "correcting motor baud rate register"
             );
-            self.with_eeprom_unlocked(id, |c| c.write_baudrate(id, 0))?;
+            self.with_eeprom_unlocked(id, |c| c.write_baudrate(id, FEETECH_BAUD_REGISTER))?;
             fixed += 1;
         }
         Ok(fixed)
