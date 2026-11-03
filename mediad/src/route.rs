@@ -72,6 +72,15 @@ fn permits(call: &proto::Call) -> bool {
         RobotChorale(_) | ChoraleSubscribe | ChoraleBeaconSet(_) | ChoraleHeard(_) => false,
         RobotHealth | RobotMode => true,
 
+        // Feetech port, `opi3w-feetech`: the bus commissioning status is a read-only
+        // diagnostic — the same class as `robot.health`, and it answers nothing a
+        // remote peer could act on destructively. The bus *commands* stay refused:
+        // each one takes the wire to itself (the daemon pauses the control loop for
+        // it), so it is a bench tool for someone running `robotctl` in the room, not
+        // something a session that happens to hold the camera should reach.
+        RobotBusStatus => true,
+        RobotBusCommand(_) => false,
+
         // Telemetry at up to the control rate. BLE called this "a firehose into a 20-byte pipe",
         // which it is; here it is a stream on a channel built for streams.
         RobotSubscribe(_) => true,
