@@ -4525,6 +4525,16 @@ async fn control_loop<T: RobotIo>(
             1.0
         };
 
+        // What the daemon knows about torque, in the same three words `robot.busStatus` uses:
+        // 1 `all_enabled`, 2 `off`, 0 `unknown` (nothing confirmed yet — a fresh boot, or a bus
+        // that has not answered). `unknown` is deliberately *not* read as limp: a daemon
+        // restarted under a standing robot starts in `Limp` while the servos still hold, so
+        // claiming a slack robot there would be its own lie. It becomes `off` on the first tick
+        // that confirms the cut — the Feetech bus tracks the bit itself, see
+        // `RobotIo::torque_confirmed` — and that is the tick `robot.relax` lands on.
+        let torque_state = state.torque_state.load(Ordering::Relaxed);
+        let holds_nothing = torque_state == 2;
+
         let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
             // The limp-fall sequence, before anything else — `driving` is false throughout,
             // so without this it would fall through to the hold branch and the robot would
@@ -4605,6 +4615,11 @@ async fn control_loop<T: RobotIo>(
                 true,
                 "homing".into(),
             ),
+            // Torque is off: a fresh boot, `robot.relax`, `robot.rebootMotors`. Nothing is being
+            // held, so `held` is the wrong word — a client reading it believes a pose is under
+            // torque and may drive a slack robot. `busStatus.native.hd1910.gain_mode` has said
+            // `limp` in exactly this state all along; this is the same word on the other wire.
+            _ if holds_nothing => (hold, policy_cfg.gain, false, "limp".into()),
             _ => (hold, policy_cfg.gain, false, "held".into()),
         };
         state.moving.store(moving, Ordering::Relaxed);
@@ -4855,10 +4870,19 @@ async fn control_loop<T: RobotIo>(
                 policy: policy_label.into_owned(),
                 safety: proto::SafetyState {
                     fallen: safety.fallen(),
-                    // Limp means "the robot is actually at limp gain" — which now happens
-                    // in exactly one place, the limp-fall sequence riding a fall down. A
-                    // bare fall verdict is a report, not a state.
-                    limp: matches!(limp_fall, LimpFall::Limp { .. }),
+                    // Limp means "nothing is holding the robot", and there are two ways to be
+                    // there: torque confirmed off (`robot.relax`, `robot.rebootMotors`, and a
+                    // fresh boot once the first read lands — the servos are slack) and the
+                    // limp-fall sequence, which drops the gain to `gain_limp` on the way down.
+                    // Before this, torque off read `limp: false` with `policy: "held"` — the
+                    // one answer unusable by a client, because it described a robot standing
+                    // under torque while it lay slack on the floor.
+                    //
+                    // Read afresh rather than reusing the label's copy: `note_torque` ran with
+                    // this tick's write, so the frame a `robot.relax` lands in already says
+                    // limp, while the label above still read the previous tick.
+                    limp: state.torque_state.load(Ordering::Relaxed) == 2
+                        || matches!(limp_fall, LimpFall::Limp { .. }),
                     gravity: sensors.imu.gravity,
                     gain: safety.gain(),
                     picked_up: pickup_paused,
@@ -8758,6 +8782,113 @@ mod tests {
         );
         assert_eq!(frame.policy, "held", "no policy was loaded");
         assert_eq!(frame.joints.len(), NUM_JOINTS);
+    }
+
+    /// **A robot with torque off says so, on both fields.**
+    ///
+    /// `robot.relax` used to leave `policy: "held"` and `safety.limp: false` on the stream: a
+    /// robot slack on the floor, described as holding a pose under torque. Both Studio and the
+    /// pad read these fields to decide whether the robot can be handled, so the report has to
+    /// agree with the servos — `busStatus.native.hd1910.gain_mode` already said `limp`.
+    ///
+    /// Runs on [`TorqueTrackingIo`] rather than `FakeIo`: the daemon only says `limp` once the
+    /// bus confirms the cut, and `FakeIo` has no torque bit to confirm (`torque_confirmed`
+    /// answers `None`, which the loop reads as "still holding"). The Feetech bus tracks the bit
+    /// itself, which is exactly what this wrapper reproduces.
+    struct TorqueTrackingIo {
+        inner: FakeIo,
+        on: bool,
+    }
+
+    impl RobotIo for TorqueTrackingIo {
+        fn read(&mut self) -> duck_control::io::Result<duck_control::io::Sensors> {
+            self.inner.read()
+        }
+
+        fn write(
+            &mut self,
+            targets: &duck_control::io::JointTargets,
+        ) -> duck_control::io::Result<()> {
+            self.inner.write(targets)
+        }
+
+        fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
+            self.inner.set_gain(kp)
+        }
+
+        fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
+            self.inner.set_torque(on)?;
+            self.on = on;
+            Ok(())
+        }
+
+        fn torque_confirmed(&self) -> Option<bool> {
+            Some(self.on)
+        }
+
+        fn reboot(&mut self, id: u8) -> duck_control::io::Result<()> {
+            self.inner.reboot(id)
+        }
+
+        fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::io::SlowSensors> {
+            self.inner.slow_sensors()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relaxed_robot_reports_limp_not_held() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let mut states = s.state_tx.subscribe();
+
+        let intents = Arc::new(Intents::new());
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            // Starting torqued: this is a robot that was holding a pose a moment ago.
+            TorqueTrackingIo {
+                inner: FakeIo::at(DEFAULT_POSITION),
+                on: true,
+            },
+            loop_state,
+            Arc::clone(&intents),
+            params,
+            PathBuf::from("/nonexistent/robotd.toml"),
+            Duration::from_millis(2),
+            noop_poweroff(),
+        ));
+
+        intents.request_relax();
+        let mut limp = None;
+        for _ in 0..200 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), states.recv())
+                .await
+                .expect("a frame within five seconds")
+                .expect("the stream stayed open");
+            if frame.policy == "limp" {
+                limp = Some(frame);
+                break;
+            }
+        }
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        let frame = limp.expect("a frame saying the robot is limp after robot.relax");
+        assert!(
+            frame.safety.limp,
+            "torque is off, so nothing holds the robot"
+        );
     }
 
     /// Measured velocity and load must reach the state stream.

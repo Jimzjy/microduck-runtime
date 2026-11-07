@@ -2090,7 +2090,8 @@ impl View {
             .dim(),
         );
         // The gain the servos are actually running at, next to `limp`, which is what a gain
-        // that safety has overridden looks like from the outside.
+        // that safety has overridden looks like from the outside. Limp is also where a robot
+        // with torque off sits, so the note names both rather than the gain alone.
         head.push(Span::raw(format!(
             "kp {}",
             state
@@ -2100,7 +2101,7 @@ impl View {
         )));
         if state.safety.limp {
             head.push(Span::styled(
-                " limp — gains dropped so the robot yields",
+                " limp — nothing holds the robot (torque off or yielding)",
                 Style::new().fg(Color::Yellow),
             ));
         }

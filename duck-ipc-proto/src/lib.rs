@@ -4468,7 +4468,13 @@ pub struct MoveState {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SafetyState {
     pub fallen: bool,
-    /// Gains have been dropped so the robot yields.
+    /// Nothing is holding the robot: torque is off (a fresh boot, `robot.relax`, a servo
+    /// reboot — the servos are slack), or the limp-fall sequence has dropped the gain to
+    /// `gain_limp` so the robot yields to the floor on the way down.
+    ///
+    /// While this is true `policy` does not say `held`: that label means a pose is being
+    /// held under torque, and reporting it for a slack robot is the one answer a client
+    /// cannot act on.
     pub limp: bool,
     /// Projected gravity in the trunk frame, the input `fallen` is decided from. Upright is
     /// about `[0, 0, -1]`.
