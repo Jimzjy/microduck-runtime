@@ -461,7 +461,7 @@ pub fn start(
             src
         }
         #[cfg(target_os = "linux")]
-        Source::Camera(camera) => camera_source(camera, fps)?,
+        Source::Camera(camera) => camera_source(camera, width, height, fps)?,
         // Not "unsupported": `[media] camera = true` off a robot is a config file copied from one,
         // and the fix is to name whichever of the other two sources was meant.
         #[cfg(not(target_os = "linux"))]
@@ -1328,8 +1328,17 @@ fn make(name: &str) -> Result<gst::Element> {
 /// belong to the *subprocess* shape: `v4l2src` attaches a `GstVideoMeta` describing the real
 /// layout, and the frame loss has a cause with a small fix — see [`raise_capture_buffers`].
 #[cfg(target_os = "linux")]
-fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
+fn camera_source(camera: &Camera, width: u32, height: u32, fps: u32) -> Result<gst::Element> {
     let sensor = pin_sensor_mode(camera.expected, fps)?;
+
+    // Some capture drivers — the A733's `vin_v4l2` is one — advertise Bayer fourccs that
+    // `v4l2src` cannot map to a `GstVideoFormat`, and nothing else that returns a real picture.
+    // There is no element that can source that, so it is captured by hand; see
+    // [`raw_bayer_source`] for what was measured.
+    if raw_capture_required(&camera.device) {
+        return raw_bayer_source(camera, sensor, width, height, fps);
+    }
+
     let (exposure, analogue_gain) = camera.starting(sensor);
 
     // Exposure and gain go through `extra-controls` rather than a `v4l2-ctl` call, so they are
@@ -1360,6 +1369,402 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
         "head camera"
     );
     Ok(src)
+}
+
+/// Bayer fourccs. `v4l2src` builds its device caps from `VIDIOC_ENUM_FMT` through a table of
+/// `GstVideoFormat` mappings, and that table has no Bayer entry for any of these — so a device whose
+/// list is only Bayer negotiates nothing and fails at state change with
+/// `Device '/dev/videoN' has no supported format`.
+#[cfg(target_os = "linux")]
+const BAYER_FOURCCS: [&str; 8] = ["RG10", "BA10", "GR10", "GB10", "RG12", "BA12", "GR12", "GB12"];
+
+/// Whether this device has to be captured by hand rather than through `v4l2src`.
+///
+/// Asked of the driver rather than assumed from the board: the list `v4l2-ctl --list-formats`
+/// prints is the same list `v4l2src` negotiates from, so a Bayer fourcc in it is exactly the
+/// condition under which the element cannot start.
+///
+/// **On the A733's `vin_v4l2` it is also the only format that carries a picture.** The same list
+/// advertises the ISP formats (`NV16`, `422P`, `RGB3`, …) and those do negotiate — but the buffers
+/// they deliver are the raw sensor data or an un-tuned black frame, measured on the board: `NV16`
+/// decoded to a luma mean of 36 with no image in it, `RGB3` to a dark purple field. Only `RG10`
+/// renders the scene, and asking for it is what `S_INPUT` makes possible at all.
+#[cfg(target_os = "linux")]
+fn raw_capture_required(device: &str) -> bool {
+    let Ok(output) = std::process::Command::new("v4l2-ctl")
+        .args(["-d", device, "--list-formats"])
+        .output()
+    else {
+        // No v4l-utils to ask: leave the decision to `v4l2src`, which is the right answer on every
+        // board this daemon was written for.
+        return false;
+    };
+    let listing = String::from_utf8_lossy(&output.stdout);
+    BAYER_FOURCCS
+        .iter()
+        .any(|fourcc| listing.contains(&format!("'{fourcc}'")))
+}
+
+/// `SRGGB10_1X10` → the `video/x-bayer` format name `rggb10le`, and the rest of the family.
+///
+/// The two ends spell the same packing differently: the media bus names the pattern and the bit
+/// depth over one lane, `video/x-bayer` names it plus the byte order of the container, which is
+/// little-endian for every sensor here — each pixel is a `u16` whose low ten bits carry the sample.
+#[cfg(target_os = "linux")]
+fn bayer_caps_format(bus_format: &str) -> Result<&'static str> {
+    match bus_format {
+        "SRGGB10_1X10" => Ok("rggb10le"),
+        "SGRBG10_1X10" => Ok("grbg10le"),
+        "SGBRG10_1X10" => Ok("gbrg10le"),
+        "SBGGR10_1X10" => Ok("bggr10le"),
+        other => Err(anyhow!(
+            "no raw capture for media bus format {other}; it needs a `video/x-bayer` name added to \
+             bayer_caps_format"
+        )),
+    }
+}
+
+/// The buffer geometry the driver actually allocated, asked of it after `S_FMT`.
+///
+/// `G_FMT` reports the height that was requested, but `Bytes per Line` and `Size Image` describe
+/// the buffer: on this driver 1920x1080 comes back with 3840 bytes per line and a size of 4,177,920
+/// — 1088 lines, eight more than asked for. A reader that believes the requested height leaves
+/// eight lines unread after the first frame, and every frame after that is cut at the wrong offset:
+/// the samples then saturate and the picture arrives pure white (measured). So the frame size is
+/// measured, never computed from the request.
+///
+/// `--set-input=0` comes first for the same reason it does everywhere else on this driver: without
+/// it `S_FMT` is refused, so there is nothing to ask about.
+#[cfg(target_os = "linux")]
+fn probe_geometry(device: &str, width: u32, height: u32) -> Option<(u32, u32, usize)> {
+    let format = format!("--set-fmt-video=width={width},height={height},pixelformat=RG10");
+    let output = std::process::Command::new("v4l2-ctl")
+        .args(["-d", device, "--set-input=0", &format, "--get-fmt-video"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let number = |name: &str| -> Option<usize> {
+        let line = text.lines().find(|line| line.contains(name))?;
+        line.rsplit(':').next()?.trim().parse().ok()
+    };
+    let stride = number("Bytes per Line")?;
+    let size = number("Size Image")?;
+    (stride > 1 && size > 0 && size % stride == 0)
+        .then(|| ((stride / 2) as u32, (size / stride) as u32, size))
+}
+
+/// The head camera as a raw Bayer capture, for a driver `v4l2src` cannot source.
+///
+/// **A `v4l2-ctl` process rather than a V4L2 loop of our own**, and for the same reason
+/// [`camera_source`] would rather use `v4l2src`: the ioctl argument structs are hand-pinned layouts
+/// and one wrong offset is a capture that misreads every frame. This file already shells out to
+/// `media-ctl` for the sensor mode and to `v4l2-ctl` for the exposure controls, so the tools are
+/// required for the camera anyway; `--stream-to=-` writes whole frames to stdout, which is a shape
+/// [`read_frames`] already handles for the simulator.
+///
+/// **`--set-input=0` is not optional on this driver.** `vin_open()` only sets a flag; the sensor
+/// power-up, the media link setup and `__vin_pipeline_open(prepare)` all happen in
+/// `vidioc_s_input()`. Without it the format still sets and `STREAMON` still succeeds, and not one
+/// frame arrives — the sensor's MCLK is never enabled, measured: `csi-master1` `enable_cnt 0` while
+/// streaming.
+///
+/// The buffer is padded by the driver — 1920x1080 arrives as 1088 lines — so the geometry comes
+/// from [`probe_geometry`] rather than from the request, and the reader can never desynchronise
+/// from the stream; [`videoscale`] below takes the extra lines back off.
+#[cfg(target_os = "linux")]
+fn raw_bayer_source(
+    camera: &Camera,
+    sensor: &'static crate::sensor::Sensor,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<gst::Element> {
+    use gst::prelude::*;
+
+    let bayer = bayer_caps_format(sensor.bus_format)?;
+    // Captured at the sensor's own mode, not at the rung. `pin_sensor_mode` pins the sensor to
+    // 1920x1080, so asking the VIN scaler for a smaller RAW frame is a second mode change the
+    // sensor never took part in; `videoscale` below does the rung instead.
+    let (cap_width, cap_height, frame_size) =
+        probe_geometry(&camera.device, sensor.mode.width, sensor.mode.height).unwrap_or_else(|| {
+            // No answer: fall back to the sensor mode, rounded the way this driver pads (16 lines).
+            let padded = sensor.mode.height.div_ceil(16) * 16;
+            (
+                sensor.mode.width,
+                padded,
+                sensor.mode.width as usize * 2 * padded as usize,
+            )
+        });
+
+    let caps = gst::Caps::builder("video/x-bayer")
+        .field("format", bayer)
+        .field("width", cap_width as i32)
+        .field("height", cap_height as i32)
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+
+    let src = gst_app::AppSrc::builder()
+        .caps(&caps)
+        .is_live(true)
+        .do_timestamp(true)
+        .format(gst::Format::Time)
+        .build();
+
+    let device = camera.device.clone();
+    // `--exposure` is honoured by name: the vendor driver does have an `exposure` control, in lines
+    // like every other sensor here. Gain is not: this driver calls it `gain`, with units nothing
+    // has measured against an IMX219's 256-per-1x, so writing a sensor's analogue value into it
+    // would be a guess that reaches the picture.
+    let controls = camera.exposure.map(|lines| format!("exposure={lines}"));
+    if camera.analogue_gain.is_some() {
+        tracing::warn!(
+            "analogue gain is not written on this capture path: the driver's control is named \
+             `gain` and its units are not the sensor's 256-per-1x"
+        );
+    }
+    let pushable = src.clone();
+    std::thread::Builder::new()
+        .name("bayer-camera".into())
+        .spawn(move || {
+            let mut complained = false;
+            loop {
+                match pump_capture(&device, controls.as_deref(), cap_width, cap_height, frame_size, &pushable) {
+                    Ok(()) => {
+                        complained = false;
+                        tracing::warn!(%device, "the raw camera closed");
+                    }
+                    Err(e) if !complained => {
+                        complained = true;
+                        tracing::warn!(%device, error = %e, "no raw camera; retrying");
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| tracing::error!(error = %e, "no reader thread for the raw camera"));
+
+    // `bayer2rgb` debayers in software — 1080p at 32 fps on the A733's eight cores, measured — and
+    // `videoscale` gives back any quality rung smaller than the sensor mode. `videoconvert` sits
+    // last so it is the element the capsfilter downstream negotiates its `UYVY` with: the decoder
+    // only emits packed RGB, and converting before scaling would convert four times the pixels for
+    // nothing.
+    let debayer = make("bayer2rgb").map_err(|_| {
+        anyhow!(
+            "no bayer2rgb element; it comes from gstreamer1.0-plugins-bad, which \
+             scripts/setup-gstreamer.sh installs"
+        )
+    })?;
+    let scale = make("videoscale")?;
+    let convert = make("videoconvert")?;
+
+    // The driver pads the buffer to 1088 lines for a 1080-line mode, and those eight rows are not
+    // picture. Left in, the caps carry the wrong height and everything downstream that reasons
+    // about aspect (this pipeline's own scaler, and `webrtcsink`'s codec discovery, which asked for
+    // 1271x720 and then failed to find an encoder that takes an odd width) computes a slightly
+    // wrong shape. Cropped here, right after the debayer, so the pipeline sees the sensor's mode.
+    let padding = cap_height.saturating_sub(sensor.mode.height);
+    let crop = (padding > 0)
+        .then(|| {
+            gst::ElementFactory::make("videocrop")
+                .property("bottom", padding as i32)
+                .build()
+                .map_err(|_| anyhow!("no videocrop element; it comes from gstreamer1.0-plugins-good"))
+        })
+        .transpose()?;
+
+    let bin = gst::Bin::new();
+    let mut chain: Vec<&gst::Element> = vec![src.upcast_ref(), &debayer];
+    if let Some(crop) = crop.as_ref() {
+        chain.push(crop);
+    }
+    chain.extend([&scale, &convert]);
+    for element in &chain {
+        bin.add(*element)?;
+    }
+    gst::Element::link_many(&chain)?;
+    let pad = convert
+        .static_pad("src")
+        .ok_or_else(|| anyhow!("videoconvert has no src pad"))?;
+    let ghost = gst::GhostPad::builder_with_target(&pad)?.name("src").build();
+    bin.add_pad(&ghost)?;
+
+    tracing::info!(
+        device = %camera.device,
+        sensor = sensor.name(),
+        bayer,
+        cap_width,
+        cap_height,
+        width,
+        height,
+        fps,
+        "head camera (raw Bayer capture)"
+    );
+    Ok(bin.upcast())
+}
+
+/// One `v4l2-ctl` capture, pushed into the pipeline frame by frame, until either end stops.
+#[cfg(target_os = "linux")]
+fn pump_capture(
+    device: &str,
+    controls: Option<&str>,
+    width: u32,
+    cap_height: u32,
+    frame_size: usize,
+    src: &gst_app::AppSrc,
+) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let format = format!("--set-fmt-video=width={width},height={cap_height},pixelformat=RG10");
+    let set_ctrl = controls.map(|controls| format!("--set-ctrl={controls}"));
+    // **A FIFO rather than `--stream-to=-`.** `v4l2-ctl` announces what it did on *stdout* — "Video
+    // input set to 0 (sunxi-vin: Camera, ok)" is 45 bytes — and `--silent` does not suppress that
+    // one. Sent down a pipe, those 45 bytes land in front of the first frame, every later frame is
+    // read 45 bytes early, and the debayered picture comes out pure white with no structure at all
+    // (measured: luma 235 flat, against 19 from the same frames on a FIFO).
+    let fifo = capture_fifo();
+    let _ = std::fs::remove_file(&fifo);
+    if let Some(parent) = fifo.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let fifo_file = open_fifo(&fifo)?;
+
+    let fifo_arg = format!("--stream-to={}", fifo.display());
+    let mut args: Vec<&str> = vec!["-d", device, "--set-input=0"];
+    if let Some(ctrl) = set_ctrl.as_deref() {
+        args.push(ctrl);
+    }
+    args.extend([&format, "--stream-mmap=4", &fifo_arg]);
+    // **The child must not outlive this process.** A `pkill mediad` (or a systemd stop) kills the
+    // daemon without unwinding, so the `kill()` below never runs and an orphaned `v4l2-ctl` keeps
+    // `/dev/video0` open. The next start then cannot even list the formats — it fell back to
+    // `v4l2src`, which failed with `Device or resource busy` (measured, on a plain restart).
+    // `PR_SET_PDEATHSIG` makes the kernel do this cleanup, whatever kills us.
+    let mut command = std::process::Command::new("v4l2-ctl");
+    command
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `prctl` is async-signal-safe, and the closure runs between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn()?;
+
+    // Killed on every exit, including the failing ones: a `v4l2-ctl` left streaming holds the
+    // device, and the next start would then fail with `video0 open busy`.
+    let result = (|| -> std::io::Result<()> {
+        let mut frame = vec![0u8; frame_size];
+        let mut reported = false;
+        loop {
+            // A capture that never starts would otherwise block this thread forever, and the
+            // retry above could never run. A quiet second means start over.
+            if !wait_readable(&fifo_file, 5000)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "v4l2-ctl produced no frames for 5s",
+                ));
+            }
+            (&fifo_file).read_exact(&mut frame)?;
+            if !reported {
+                reported = true;
+                let samples: u32 = frame
+                    .chunks_exact(2)
+                    .take(4096)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]) as u32)
+                    .sum();
+                tracing::debug!(
+                    mean = samples / 4096,
+                    head = ?&frame[..8],
+                    "raw capture first frame"
+                );
+            }
+            let mut buffer = gst::Buffer::with_size(frame_size).map_err(std::io::Error::other)?;
+            buffer
+                .get_mut()
+                .expect("a fresh buffer is writable")
+                .map_writable()
+                .map_err(std::io::Error::other)?
+                .copy_from_slice(&frame);
+            if src.push_buffer(buffer).is_err() {
+                return Ok(()); // the pipeline is gone
+            }
+        }
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&fifo);
+    result
+}
+
+/// Where a capture writes its frames, one FIFO per process.
+#[cfg(target_os = "linux")]
+fn capture_fifo() -> std::path::PathBuf {
+    let dir = std::path::Path::new("/run/mediad");
+    let dir = if dir.is_dir() {
+        dir.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    dir.join(format!("capture-{}.fifo", std::process::id()))
+}
+
+/// Create (if missing) and open the read end of a FIFO.
+///
+/// Opened non-blocking and then switched back, so that a `v4l2-ctl` that dies before opening its
+/// own end cannot leave this call stuck on `open` with no writer in sight.
+#[cfg(target_os = "linux")]
+fn open_fifo(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::other("the FIFO path contains a NUL"))?;
+    // SAFETY: `mkfifo` only creates the named path; a leftover from a killed run is reported as
+    // EEXIST and is fine, since the caller removed it first anyway.
+    let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    if made != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+    }
+    // SAFETY: plain `open` on a path we just created.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is ours, and the blocking flag is what read_exact wants.
+    unsafe { libc::fcntl(fd, libc::F_SETFL, 0) };
+    // SAFETY: the descriptor is owned by the returned File from here on.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Whether the FIFO has bytes within `millis`, so a stalled capture can be retried instead of
+/// blocking the thread forever.
+#[cfg(target_os = "linux")]
+fn wait_readable(file: &std::fs::File, millis: i32) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut poll = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one pollfd, valid descriptor, no timeout violations.
+    let rc = unsafe { libc::poll(&mut poll, 1, millis) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(rc > 0)
 }
 
 /// A simulated camera as an `appsrc`, fed by a thread reading frames off a socket.
