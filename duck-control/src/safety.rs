@@ -228,6 +228,12 @@ impl<T: RobotIo> Safety<T> {
         self.io.set_torque(on)
     }
 
+    /// What the bus itself says the servos' torque bit is — see [`RobotIo::torque_confirmed`].
+    /// `None` when this backend has no opinion and a written goal remains the only proof.
+    pub fn torque_confirmed(&self) -> Option<bool> {
+        self.io.torque_confirmed()
+    }
+
     /// Reboot these servos, and forget the gain cache: a rebooted servo comes back at its EEPROM
     /// gains, and a cache that still says the running gain is written would leave it there. The
     /// next [`Self::apply`] rewrites the gains on every servo.

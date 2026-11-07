@@ -135,6 +135,13 @@ impl RobotIo for AnyBus {
         each!(self, io => RobotIo::set_torque(io, on))
     }
 
+    fn torque_confirmed(&self) -> Option<bool> {
+        // Must not fall through to the trait default (`None`): the loop treats
+        // "unknown" as "on", which would pin `torque_state` at all-enabled and
+        // leave the Studio gate refusing a robot whose servos are measurably off.
+        each!(self, io => io.torque_confirmed())
+    }
+
     fn reboot(&mut self, id: u8) -> Result<()> {
         each!(self, io => io.reboot(id))
     }

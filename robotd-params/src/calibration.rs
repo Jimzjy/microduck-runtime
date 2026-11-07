@@ -177,9 +177,12 @@ impl Calibration {
             check_quat(mount.quat, &format!("imu_mounts.{chip}.quat"))?;
         }
         if let Some(protocol) = &self.imu_bus_protocol {
-            if protocol != "feetech" && protocol != "dxl2" {
+            // "bus" is this fork's name for the board on the servo wire (the Feetech port reports
+            // it that way in `busStatus`), and the mount a person verified is recorded against it.
+            // Without it here, the file a verified robot writes would not load again.
+            if protocol != "feetech" && protocol != "dxl2" && protocol != "bus" {
                 return err(format!(
-                    "imu_bus_protocol is {protocol:?}; only \"feetech\" or \"dxl2\" is one"
+                    "imu_bus_protocol is {protocol:?}; only \"feetech\", \"dxl2\" or \"bus\" is one"
                 ));
             }
         }

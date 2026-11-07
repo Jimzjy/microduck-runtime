@@ -1,7 +1,7 @@
 //! The Feetech bus — STS/SMS-protocol servos (HD-1910) in place of the XL330s.
 //!
-//! The same shape as [`crate::bus`]: one `sync_read` per tick, one `sync_write` of goal
-//! positions, and the same startup census, register check and motor-swap path. What differs is
+//! The same shape as [`crate::bus`]: one `sync_read` per tick, one goal pass per tick, and
+//! the same startup census, register check and motor-swap path. What differs is
 //! the wire — Feetech's own framing (`FF FF id len instr … ~sum`), which `rustypot` carries as
 //! its "protocol v1" together with the STS register table — and four facts about the servo
 //! that change what the code around the wire has to do:
@@ -24,11 +24,20 @@
 //!   measured on the bench, a non-servo block ahead of a servo makes the servo's answer run a
 //!   byte early and the board's checksum then eats the next block's first byte. Whether the
 //!   board is expected at all is [`FeetechConfig::imu_on_bus`].
+//! - **A goal write re-powers the servo, and SYNC_WRITE is dropped.** Measured on the
+//!   HD-1910: any WRITE of `goal_position` — unicast or REG_WRITE — sets `torque_enable`
+//!   (register 40) back to 1 whatever it said before, and SYNC_WRITE (0x23) is ignored
+//!   outright, goals included. So goals go out as one REG_WRITE per joint plus one broadcast
+//!   ACTION ([`FeetechIo::write`]), and while the robot is limp no goal write is sent at all
+//!   — a limp that wrote goals would be a limp that re-enables its own torque. A servo that
+//!   still creeps back on under read-only traffic is caught by the watchdog in
+//!   [`FeetechIo::read`].
 //!
 //! Register addresses and semantics are from Feetech's *磁编码 STS 内存表* v1.1 (2026-08-27) and
 //! *SCS 通信协议* v1.0 (2026-06-09); `rustypot`'s `sts3215` table agrees with them.
 
 use std::f64::consts::PI;
+use std::io::Write as _;
 use std::time::Duration;
 
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
@@ -53,6 +62,19 @@ const READ_LEN: u8 = 15;
 /// `goal_position`, two bytes, little-endian. Written raw rather than through rustypot's
 /// `AnglePosition` so the per-joint direction and the 0–4095 clamp are applied in one place.
 const GOAL_POSITION_ADDR: u8 = 42;
+
+/// `torque_enable`, one byte. What a limp must keep an eye on — see the watchdog in
+/// [`FeetechIo::read`].
+const TORQUE_ENABLE_ADDR: u8 = 40;
+
+/// REG_WRITE (0x04) and ACTION (0x05): how a goal reaches an HD-1910. Its firmware drops
+/// SYNC_WRITE (0x23) outright — measured with correct packets and checksums, nothing happens
+/// — so each tick's goals become one deferred register write per joint, latched together by
+/// a single broadcast ACTION. Neither instruction is answered, which is why this path costs
+/// a third of what fifteen acknowledged unicast writes would.
+const REG_WRITE_INSTR: u8 = 0x04;
+const ACTION_INSTR: u8 = 0x05;
+const BROADCAST_ID: u8 = 0xFE;
 
 /// Version block: firmware major/minor, the endianness flag, servo major/minor.
 const VERSION_ADDR: u8 = 0;
@@ -230,19 +252,41 @@ pub struct FeetechIo {
     imu: SflpDecoder,
     /// Counts reads in which the board answered without refreshing.
     stale_imu: StaleImuTracker,
+    /// Whether the daemon last commanded torque on. Gates the goal pass — see
+    /// [`FeetechIo::write`] — and arms the limp watchdog — see [`FeetechIo::read`].
+    torque_on: bool,
+    /// Tick counter for the limp watchdog.
+    limp_ticks: u32,
+    /// A second handle on the same port, for the goal writes. `rustypot` owns its serial port
+    /// privately, and its protocol-1.0 vocabulary has no REG_WRITE instruction — so the
+    /// per-joint REG_WRITE and the broadcast ACTION are written by hand through this handle.
+    /// All bus access is sequential on one thread, so the two handles never talk at once.
+    raw: Box<dyn serialport::SerialPort>,
 }
 
 impl FeetechIo {
     pub fn open(port: &str, config: FeetechConfig) -> Result<Self> {
         let ids = read_ids(config.imu_on_bus);
+        // One port, two handles: `serialport` takes an exclusive flock on every open, so a
+        // second open of the same device fails outright. The controller gets a `try_clone` —
+        // a dup of the same open file description, which shares the lock instead of
+        // fighting for it — and this struct keeps the original for the hand-built
+        // REG_WRITE/ACTION goal packets. All bus access is sequential on one thread.
+        let raw = open_raw_port(port, BAUD_RATE)?;
+        let controller = open_controller(raw
+            .try_clone()
+            .map_err(|e| IoError::Bus(format!("clone the motor serial port: {e}")))?);
         Ok(Self {
-            controller: open_controller(port, BAUD_RATE)?,
+            controller: controller?,
             config,
             speed_steps_per_count: 1.0,
             last_slow: None,
             ids,
             imu: SflpDecoder::new(SflpDecoder::DEFAULT_MOUNT),
             stale_imu: StaleImuTracker::default(),
+            torque_on: false,
+            limp_ticks: 0,
+            raw,
         })
     }
 
@@ -520,6 +564,11 @@ impl FeetechIo {
                 failed.push(format!("torque {on} on {id}: {e}"));
             }
         }
+        // Recorded whether or not every servo answered: a servo that missed its torque-off
+        // write is caught by the limp watchdog, and a missed torque-on shows up as a joint
+        // that does not hold. Either way the gate below must follow what was asked for, not
+        // what the bus managed.
+        self.torque_on = on;
         if failed.is_empty() {
             Ok(())
         } else {
@@ -552,17 +601,35 @@ impl FeetechIo {
 }
 
 /// The serial port at `baud`, wrapped in a Feetech-protocol controller.
-fn open_controller(port: &str, baud: u32) -> Result<Sts3215Controller> {
-    let serial = serialport::new(port, baud)
+fn open_controller(serial: Box<dyn serialport::SerialPort>) -> Result<Sts3215Controller> {
+    Ok(Sts3215Controller::new()
+        .with_protocol_v1()
+        .with_serial_port(serial))
+}
+
+/// A plain serial handle at `baud` — the port both bus halves use: `rustypot` wraps a
+/// `try_clone` of it, and the hand-built REG_WRITE/ACTION goal packets go out through the
+/// original.
+fn open_raw_port(port: &str, baud: u32) -> Result<Box<dyn serialport::SerialPort>> {
+    serialport::new(port, baud)
         .timeout(READ_TIMEOUT)
         .open()
         .map_err(|e| IoError::Port {
             path: port.to_owned(),
             source: std::io::Error::other(e),
-        })?;
-    Ok(Sts3215Controller::new()
-        .with_protocol_v1()
-        .with_serial_port(serial))
+        })
+}
+
+/// A protocol-1.0 instruction packet: `FF FF id len instr params ~sum`, where `len` counts
+/// the instruction, the parameters and the checksum, and the checksum inverts the byte sum
+/// from `id` onwards.
+fn packet(id: u8, instruction: u8, params: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(params.len() + 8);
+    pkt.extend_from_slice(&[0xFF, 0xFF, id, (params.len() + 2) as u8, instruction]);
+    pkt.extend_from_slice(params);
+    let sum = pkt[2..].iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+    pkt.push(!sum);
+    pkt
 }
 
 /// rustypot returns a `Vec` even for a single-id read; an empty one means the servo did not
@@ -657,6 +724,34 @@ fn read_ids(imu_on_bus: bool) -> Vec<u8> {
 
 impl RobotIo for FeetechIo {
     fn read(&mut self) -> Result<Sensors> {
+        // Limp watchdog: with no goal WRITE ever sent while torque is off (see `write`), the
+        // remaining way a joint re-powers itself is noise on the wire — under continuous
+        // sync traffic a servo has been measured flipping its torque register back on, a few
+        // seconds after a relax, with nothing in this daemon asking for it. Once a second,
+        // read every joint's torque register and write it back off where it crept up: a
+        // locked joint is exactly what `relax` exists to prevent, and the log line is the
+        // evidence trail for whatever hardware investigation follows.
+        self.limp_ticks = self.limp_ticks.wrapping_add(1);
+        if !self.torque_on && self.limp_ticks.is_multiple_of(50) {
+            match self.controller.sync_read_raw_data(&JOINT_IDS, TORQUE_ENABLE_ADDR, 1) {
+                Ok(blocks) => {
+                    let flipped: Vec<u8> = JOINT_IDS
+                        .iter()
+                        .zip(blocks)
+                        .filter(|(_, block)| block.first().is_some_and(|&v| v != 0))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if !flipped.is_empty() {
+                        tracing::warn!(
+                            ids = ?flipped,
+                            "servos re-enabled torque on their own; writing it back off"
+                        );
+                        let _ = self.set_torque(false);
+                    }
+                }
+                Err(e) => tracing::debug!(error = %e, "limp torque check skipped"),
+            }
+        }
         let blocks = self
             .controller
             .sync_read_raw_data(&self.ids, READ_ADDR, READ_LEN)
@@ -748,30 +843,45 @@ impl RobotIo for FeetechIo {
     }
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
-        let data: Vec<Vec<u8>> = targets
-            .positions
-            .iter()
-            .enumerate()
-            .map(|(joint, &rad)| {
-                // The bench's limit applies before the register clamp: what the file allows is a
-                // fact about this body, and a policy asking past it is a policy that will fall.
-                let rad = self.config.clamp(joint, rad);
-                rad_to_raw(
-                    rad,
-                    self.config.directions[joint],
-                    self.config.zeros[joint],
-                )
-                .to_le_bytes()
-                .to_vec()
-            })
-            .collect();
-        self.controller
-            .sync_write_raw_data(&JOINT_IDS, GOAL_POSITION_ADDR, &data)
-            .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
+        // An HD-1910 turns its own torque on for any goal WRITE — reg40 goes to 1 whatever it
+        // said before (measured). So while the robot is limp this function must not touch the
+        // goal register at all: the only writes it has to send are goal writes, and a goal
+        // write is a torque write. `set_torque(true)` is what reopens this path.
+        if !self.torque_on {
+            return Ok(());
+        }
+        for (joint, &rad) in targets.positions.iter().enumerate() {
+            // The bench's limit applies before the register clamp: what the file allows is a
+            // fact about this body, and a policy asking past it is a policy that will fall.
+            let raw = rad_to_raw(
+                self.config.clamp(joint, rad),
+                self.config.directions[joint],
+                self.config.zeros[joint],
+            )
+            .to_le_bytes();
+            let pkt = packet(
+                JOINT_IDS[joint],
+                REG_WRITE_INSTR,
+                &[GOAL_POSITION_ADDR, raw[0], raw[1]],
+            );
+            self.raw.write_all(&pkt).map_err(|e| {
+                IoError::Bus(format!("goal reg_write on {}: {e}", JOINT_IDS[joint]))
+            })?;
+        }
+        // One broadcast ACTION latches the whole tick's register writes at once. Neither
+        // instruction is answered, so this costs ~3 ms of bus time per tick where the old
+        // per-joint unicast path would have cost fifteen round trips.
+        self.raw
+            .write_all(&packet(BROADCAST_ID, ACTION_INSTR, &[]))
+            .map_err(|e| IoError::Bus(format!("goal ACTION broadcast: {e}")))
     }
 
     fn set_torque(&mut self, on: bool) -> Result<()> {
         FeetechIo::set_torque(self, on)
+    }
+
+    fn torque_confirmed(&self) -> Option<bool> {
+        Some(self.torque_on)
     }
 
     fn reboot(&mut self, id: u8) -> Result<()> {

@@ -666,17 +666,19 @@ fn tilt_deg_of(gravity: [f64; 3]) -> f64 {
 
 /// Which IMU the calibration file describes, as a name a page can show.
 fn imu_source_name(cal: Option<&robotd_params::calibration::Calibration>) -> String {
-    // The chip whose mount was actually verified wins; failing that, any chip the file mentions,
-    // anything rather than a made-up default that would name an IMU this robot does not have.
+    // A head IMU is a table entry and wins when the file has one; the bus board is not in that
+    // table at all, and the name the protocol gives it is "bus". Saying "unknown" for a robot
+    // whose IMU *is* the bus board — every Feetech duck — made Studio's IMU page refuse the robot
+    // it was looking at, so the fallback names the source that is actually there.
     let Some(cal) = cal else {
-        return "unknown".to_owned();
+        return "bus".to_owned();
     };
     cal.imu_mounts
         .iter()
         .find(|(_, mount)| mount.verified)
         .or_else(|| cal.imu_mounts.iter().next())
         .map(|(chip, _)| chip.clone())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .unwrap_or_else(|| "bus".to_owned())
 }
 
 /// Write a verified mount back to the calibration file, and to the copy this daemon is using.
@@ -687,6 +689,11 @@ fn store_imu_mount(state: &RobotState, mount: [f64; 4]) -> Result<(), String> {
         .map(|cal| (*cal).clone())
         .unwrap_or_else(robotd_params::calibration::Calibration::factory);
     cal.set_imu_mount(mount);
+    // opi3w: record which source the mount belongs to, because the page and the helper compare it
+    // against `busStatus` before they believe a readback — a file that never names its protocol
+    // reads as the Dynamixel default ("feetech") and fails that comparison on this fork, whose bus
+    // board reports "bus".
+    cal.imu_bus_protocol = Some("bus".to_owned());
     std::fs::write(&state.calibration_path, cal.render()).map_err(|e| {
         format!(
             "the gesture was right, but {} could not be written: {e}. Nothing saved.",
@@ -808,7 +815,9 @@ fn bench_tick(
 
     // Relax ends a hold. On a limp robot the servos hold nothing, so a pose "still being held"
     // would be a pose falling over — and Studio's own rule is that relax is how you get out.
-    if state.torque_state.load(Ordering::Relaxed) == 2 {
+    // opi3w: Studio's coarse redo flow verifies limp (the recalibrate session keeps torque off
+    // on purpose), so only an actual hold — a pose that falls over without torque — is refused.
+    if state.torque_state.load(Ordering::Relaxed) == 2 && bench.hold.is_some() {
         state.hold_stage.store(0, Ordering::Relaxed);
         bench.answer(Err(
             "relax was pressed while the robot was holding: nothing is holding the pose now, so \
@@ -866,8 +875,17 @@ fn bench_tick(
             ));
             return None;
         };
-        let tilt = tilt_deg_of(sensors.imu.gravity);
-        match verify.step(dt, tilt, sensors.imu.gravity) {
+        // opi3w: the gesture confirms a mount, so it has to be judged in the frame it proposes.
+        // While the stored mount is wrong — a board screwed on a different way and never verified,
+        // so still the body default — even a perfectly upright robot reads ~90° and no pose can
+        // pass, which is what made this fail however the robot was held. Studio's coarse flow
+        // exists precisely for that robot, so the candidate frame is what the gesture is about.
+        let candidate = verify.mount();
+        let calibration = state.calibration.load_full();
+        let in_use = active_imu_mount(state.board, calibration.as_deref());
+        let gravity = duck_control::imu::remount_gravity(sensors.imu.gravity, in_use, candidate);
+        let tilt = tilt_deg_of(gravity);
+        match verify.step(dt, tilt, gravity) {
             commissioning::VerifyStep::Waiting => {}
             commissioning::VerifyStep::Failed(text) => {
                 bench.answer(Err(text));
@@ -2254,6 +2272,24 @@ fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     }
 }
 
+/// The sensor→trunk mount the decoder runs with: the one a person verified for the bus board, or
+/// the body's own default when nobody has.
+///
+/// opi3w: the file's mount was read by `robot.busStatus` alone, so a verified mount never reached
+/// the decoder and every restart went back to the body default — a body whose board sits a
+/// different way than the reference build could be calibrated forever and still report the wrong
+/// attitude. `Calibration::bus_mount` is the accessor meant for exactly this ("the bus board is
+/// the default") and had no other caller.
+fn active_imu_mount(
+    board: robotd_params::board::Board,
+    calibration: Option<&robotd_params::calibration::Calibration>,
+) -> [f64; 4] {
+    match calibration {
+        Some(cal) if cal.imu_mount_verified => cal.bus_mount(),
+        _ => body_imu_mount(board),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn open_bus(
     bus: &params::Bus,
@@ -2290,8 +2326,9 @@ fn open_bus(
     // The mounting of the IMU board is a property of the body, not of the wire: the same
     // `imu_to_dxl` board answers on either bus, so both protocols get the mount. Whether the
     // board is expected at all is `[bus.feetech] imu` on the Feetech arm, and always on the
-    // Dynamixel one.
-    io.set_imu_mount(body_imu_mount(board));
+    // Dynamixel one. A mount a person verified outranks the body default — see
+    // [`active_imu_mount`].
+    io.set_imu_mount(active_imu_mount(board, calibration));
     // Dynamixel-only bring-up step: replacement adoption is a property of the Pollen bus. On
     // Feetech the servo IDs are set by the bench rig, so there is nothing to adopt.
     if matches!(protocol, BusProtocol::Dynamixel2) {
@@ -2384,6 +2421,21 @@ fn bus_protocol(
     Ok(match bus.protocol {
         params::BusProtocol::Dynamixel2 => BusProtocol::Dynamixel2,
         params::BusProtocol::FeetechSts => {
+            // A calibration file that loaded owns every joint's zero, limits *and direction*
+            // (`robotd_params::BusFeetech::calibration` says so); the params file's `directions`
+            // is the fallback for a bus that was never calibrated. Taking the zeros from the
+            // file and the directions from the params file default (+1) is how a duck came to
+            // read and write every joint mirrored while the bench that calibrated it used -1:
+            // the 3D view ran backwards and the stand pose leaned forward.
+            let directions: Vec<i8> = match calibration {
+                Some(cal) => cal.directions().iter().map(|&d| d as i8).collect(),
+                None => bus.feetech.directions.clone(),
+            };
+            tracing::info!(
+                from_calibration = calibration.is_some(),
+                directions = ?directions,
+                "feetech joint directions"
+            );
             let (zeros, limits) = match calibration {
                 Some(cal) => (cal.zeros(), cal.limits()),
                 None => {
@@ -2393,7 +2445,7 @@ fn bus_protocol(
             };
             BusProtocol::FeetechSts(FeetechConfig::new(
                 bus.feetech.p_scale,
-                &bus.feetech.directions,
+                &directions,
                 zeros,
                 limits,
                 bus.feetech.imu,
@@ -4756,8 +4808,13 @@ async fn control_loop<T: RobotIo>(
                 limits.extend(applied.limits);
                 // A target written to a servo that answered is the only proof of torque this
                 // daemon ever gets: `set_torque` returns when the bytes are acknowledged, and a
-                // servo that refuses to hold is one that will not take a goal either.
-                state.note_torque(true);
+                // servo that refuses to hold is one that will not take a goal either. Except on
+                // the Feetech bus, where a limp write is deliberately skipped (an HD1910 turns
+                // its own torque on for any goal WRITE) and the io's own tracked bit is the
+                // honest answer — without it `torque_state` read all_enabled while limp and the
+                // calibration page never saw the unload it asks for.
+                let confirmed = safety.torque_confirmed().unwrap_or(true);
+                state.note_torque(confirmed);
             }
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
         }

@@ -176,6 +176,12 @@ impl Verify {
         }
     }
 
+    /// The mount this gesture is confirming, normalised — what the tilt has to be judged against
+    /// while the robot is still running on the old one.
+    pub fn mount(&self) -> [f64; 4] {
+        self.mount
+    }
+
     pub fn step(&mut self, dt: Duration, tilt_deg: f64, gravity: [f64; 3]) -> VerifyStep {
         self.elapsed += dt;
         self.last_tilt_deg = tilt_deg;

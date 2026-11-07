@@ -185,6 +185,19 @@ fn half(bits: u16) -> f64 {
     }
 }
 
+/// The same gravity, read through a different mount.
+///
+/// `gravity` is in the trunk frame implied by `from`; the answer is in the frame `to` implies.
+/// Both are sensor→trunk mounts, so the rotation between the two frames is `to · from⁻¹`.
+///
+/// Needed by `verify-imu`: the gesture confirms a mount, and a mount that is wrong (a body whose
+/// board was never verified) puts every pose at the wrong tilt, so the gesture has to be judged
+/// in the frame it proposes rather than the one in use.
+pub fn remount_gravity(gravity: [f64; 3], from: [f64; 4], to: [f64; 4]) -> [f64; 3] {
+    let inverse = [from[0], -from[1], -from[2], -from[3]];
+    normalise(rotate(mul(to, inverse), gravity))
+}
+
 /// Hamilton product, scalar-first.
 fn mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
     let ([aw, ax, ay, az], [bw, bx, by, bz]) = (a, b);

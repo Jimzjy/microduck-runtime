@@ -144,6 +144,16 @@ pub trait RobotIo {
         true
     }
 
+    /// What the bus last knows the servos' torque bit to be, if it knows at all.
+    ///
+    /// `None` means "no opinion" — the caller falls back to reading a written goal as proof
+    /// of torque. A backend that tracks the bit itself (the Feetech one does: HD1910 ignores
+    /// SYNC_WRITE goal broadcasts, so a skipped goal write proves nothing) returns
+    /// `Some(false)` while limp, and that is what the daemon's `torque_state` should say.
+    fn torque_confirmed(&self) -> Option<bool> {
+        None
+    }
+
     /// Set the position P gain on every joint.
     ///
     /// Here rather than in the bus layer alone because it is what makes "go limp" mean
