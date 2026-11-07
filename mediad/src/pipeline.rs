@@ -1503,11 +1503,17 @@ fn raw_bayer_source(
         .field("framerate", gst::Fraction::new(fps as i32, 1))
         .build();
 
+    // `max-bytes` defaults to 200 kB, which is *smaller than one frame* here (1920x1088 RG10 =
+    // 4,177,920 B), so the default queue never fills and grows without bound: a 720p run reached
+    // 474 MB RSS on a 824 MB board and the kernel OOM-killed mediad (measured). Give the queue
+    // three frames and let it block, so a slow downstream stalls the capture instead of the box.
     let src = gst_app::AppSrc::builder()
         .caps(&caps)
         .is_live(true)
         .do_timestamp(true)
         .format(gst::Format::Time)
+        .max_bytes(frame_size as u64 * 3)
+        .block(true)
         .build();
 
     let device = camera.device.clone();
