@@ -499,12 +499,22 @@ fn main() -> ExitCode {
                 mediad::pipeline::sensor().and_then(|found| match found.sensor.metering {
                     mediad::sensor::Metering::Mediad => {
                         let (exposure, analogue_gain) = camera.starting(found.sensor);
+                        // The vendor sensor takes its exposure through a private ioctl on its own
+                        // subdev node; the standard controls are accepted and change nothing (see
+                        // `sensorctl`). Every other sensor keeps the `v4l2-ctl` path.
+                        let subdev = mediad::pipeline::sensor_subdev().map(|node| {
+                            mediad::exposure::SensorPath {
+                                node,
+                                unity_gain: found.sensor.exposure.unity_gain,
+                            }
+                        });
                         Some(mediad::exposure::spawn(
                             camera.device.clone(),
                             frames.clone(),
                             found.sensor.exposure,
                             exposure,
                             analogue_gain,
+                            subdev,
                         ))
                     }
                     // A second loop on the same sensor fights the engine; `Metering` has the

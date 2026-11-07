@@ -110,9 +110,20 @@ pub const IMX219: Sensor = Sensor {
     exposure: Exposure {
         // One line is ~19.05 µs in the pinned mode, which is 1766 lines long.
         soft_lines: 600.0,
-        hard_lines: 1200.0,
+        // **2400, not the 1200 that fills a frame.** The Allwinner driver writes the frame length
+        // from the shutter (`frame_length = shutter + 4`), so asking for more lines than a frame
+        // holds does not clip — it stretches the frame and lowers the frame rate. Measured on the
+        // board with the lights on: 1200 lines at 9.9x is the brightest a legal frame gets, and in
+        // an ordinary room that is mean luma 61 against a 90 setpoint. 2400 lines reaches the
+        // setpoint at ~14 fps, which is what the 1080p raw path was already giving us, so the extra
+        // 600 lines cost nothing until the capture side gets faster.
+        hard_lines: 2400.0,
         unity_gain: 256,
-        max_analogue: 11.0,
+        // **9.9, not 11.** The Allwinner `imx219` driver clamps `gain_val` to `[16, 159]` in its
+        // own 16-per-1x units, which is 9.94x — `sensor_s_exp_gain()` simply drops anything above
+        // it. An 11x ceiling here would be a setpoint the loop can never reach, so it would report
+        // `at_ceiling = false` for ever and keep writing the same numbers into the ioctl.
+        max_analogue: 9.9,
         start_lines: 600,
         start_analogue: 4.0,
     },

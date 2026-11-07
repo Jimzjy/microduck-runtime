@@ -1482,18 +1482,17 @@ fn raw_bayer_source(
     use gst::prelude::*;
 
     let bayer = bayer_caps_format(sensor.bus_format)?;
-    // Captured at the sensor's own mode, not at the rung. `pin_sensor_mode` pins the sensor to
-    // 1920x1080, so asking the VIN scaler for a smaller RAW frame is a second mode change the
-    // sensor never took part in; `videoscale` below does the rung instead.
+    // **Captured at the rung, not at the sensor's mode.** The VIN scaler does scale raw, and the
+    // difference is not cosmetic: measured on the board, 1080p raw into this pipeline settles at
+    // 13.6 fps while a native 1280x720 capture of the same scene reaches 26 fps, and the debayer
+    // plus `videoconvert` on 720p measures 61 fps on its own — the capture is what is short of the
+    // 30 fps target, and four megabytes a frame is why. `probe_geometry` then asks the driver how
+    // many lines it actually allocated, because the answer is not always the one requested.
     let (cap_width, cap_height, frame_size) =
-        probe_geometry(&camera.device, sensor.mode.width, sensor.mode.height).unwrap_or_else(|| {
-            // No answer: fall back to the sensor mode, rounded the way this driver pads (16 lines).
-            let padded = sensor.mode.height.div_ceil(16) * 16;
-            (
-                sensor.mode.width,
-                padded,
-                sensor.mode.width as usize * 2 * padded as usize,
-            )
+        probe_geometry(&camera.device, width, height).unwrap_or_else(|| {
+            // No answer: assume this driver's habit of padding the height to a multiple of 8.
+            let padded = height.div_ceil(8) * 8;
+            (width, padded, width as usize * 2 * padded as usize)
         });
 
     let caps = gst::Caps::builder("video/x-bayer")
@@ -1565,12 +1564,12 @@ fn raw_bayer_source(
     let scale = make("videoscale")?;
     let convert = make("videoconvert")?;
 
-    // The driver pads the buffer to 1088 lines for a 1080-line mode, and those eight rows are not
-    // picture. Left in, the caps carry the wrong height and everything downstream that reasons
-    // about aspect (this pipeline's own scaler, and `webrtcsink`'s codec discovery, which asked for
-    // 1271x720 and then failed to find an encoder that takes an odd width) computes a slightly
-    // wrong shape. Cropped here, right after the debayer, so the pipeline sees the sensor's mode.
-    let padding = cap_height.saturating_sub(sensor.mode.height);
+    // The driver pads the buffer to a whole number of 8-line blocks — 1080 arrives as 1088 — and
+    // those rows are not picture. Left in, the caps carry the wrong height and everything
+    // downstream that reasons about aspect (this pipeline's own scaler, and `webrtcsink`'s codec
+    // discovery, which asked for 1271x720 and then failed to find an encoder that takes an odd
+    // width) computes a slightly wrong shape. Cropped here, right after the debayer.
+    let padding = cap_height.saturating_sub(height);
     let crop = (padding > 0)
         .then(|| {
             gst::ElementFactory::make("videocrop")
@@ -2019,6 +2018,40 @@ pub fn sensor() -> Option<Found> {
     SENSOR.get().copied()
 }
 
+/// The media device and entity name the sensor was found under, kept so its device node can be
+/// looked up afterwards. Set once, by [`pin_sensor_mode`].
+///
+/// **The node rather than the name.** The exposure ioctl goes to `/dev/v4l-subdevN`, and that
+/// number is assigned in probe order — on this board the sensor is `subdev0` today and could be
+/// anything tomorrow once the CSIPHY or the ISP registers first. `media-ctl -e <entity>` is the
+/// lookup that follows the entity instead of guessing, and it is the same tool this file already
+/// shells out to.
+static SENSOR_TOPOLOGY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// The device node of the camera sensor's subdev — `/dev/v4l-subdev0`-style — or `None` when there
+/// is no camera or `media-ctl` cannot name it.
+///
+/// Used by [`crate::exposure`] to write the vendor's private exposure ioctl, and by nothing else:
+/// the standard V4L2 controls on this sensor accept writes and change nothing (see
+/// [`crate::sensorctl`]).
+#[cfg(target_os = "linux")]
+pub fn sensor_subdev() -> Option<String> {
+    let (media, entity) = SENSOR_TOPOLOGY.get()?;
+    let output = std::process::Command::new("media-ctl")
+        .args(["-d", media, "-e", entity])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
 /// The sensor, when it is confirmed in its pinned mode — the only case a geometry is known for.
 pub fn pinned_sensor() -> Option<&'static crate::sensor::Sensor> {
     sensor()
@@ -2044,6 +2077,8 @@ fn pin_sensor_mode(
 ) -> Result<&'static crate::sensor::Sensor> {
     let (media, entity, sensor) = find_sensor(expected)?;
     let mode = sensor.mode;
+    // Remembered for [`sensor_subdev`], which resolves the device node the exposure ioctl needs.
+    let _ = SENSOR_TOPOLOGY.set((media.clone(), entity.clone()));
 
     if expected.why == crate::sensor::Why::Forced {
         // Said at warn because it is the exception: whatever the board is, this sensor is what

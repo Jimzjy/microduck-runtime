@@ -59,6 +59,14 @@ pub mod pipeline;
 #[cfg(target_os = "linux")]
 pub mod exposure;
 
+/// The vendor sensor's private `VIDIOC_VIN_SENSOR_EXP_GAIN`, which is the only way its exposure
+/// and analogue gain move on this kernel.
+///
+/// Linux only for the same reason as [`exposure`]: it is an `ioctl` to a real sensor. See the
+/// module docs for the measurement that made `v4l2-ctl --set-ctrl` a dead end.
+#[cfg(target_os = "linux")]
+pub mod sensorctl;
+
 /// Looking for other ducks in the frames on the tee.
 ///
 /// Gated with [`pipeline`] rather than with [`exposure`]: it reads the tee's raw branch, so it

@@ -107,6 +107,10 @@ pub struct Ae {
     exposure: f64,
     analogue: f64,
     digital: f64,
+    /// False when the sensor has no ISP digital gain to steer — the Allwinner raw path never
+    /// reaches the ISP, so a `gain` setpoint there would be written to a control that does not
+    /// exist and every step would look like a change that never lands.
+    digital_available: bool,
     /// What was last handed out, so the same values are never written twice.
     written: Option<Controls>,
 }
@@ -121,16 +125,36 @@ impl Ae {
             analogue: (analogue_gain_reg as f64 / f64::from(limits.unity_gain))
                 .clamp(1.0, limits.max_analogue),
             digital: 1.0,
+            digital_available: true,
             written: None,
         }
     }
 
+    /// Tell the loop that this sensor's exposure has no digital-gain rung.
+    ///
+    /// The Allwinner IMX219 path is raw Bayer straight out of VIN: there is no ISP in the chain, so
+    /// no `gain` control exists to lift a picture the shutter and analogue gain cannot reach. Left
+    /// alone, the loop would keep allocating a digital step it can never cash in — the numbers it
+    /// wrote and the numbers it believed would disagree for ever, and `at_ceiling` would never be
+    /// true even in a room where the sensor really is at its limit.
+    pub fn without_digital_gain(mut self) -> Self {
+        self.digital_available = false;
+        self.digital = 1.0;
+        self
+    }
+
     /// Whether every control the sensor has is at its ceiling — the one state in which a dark
     /// picture is the room's fault rather than the loop's.
+    ///
+    /// The analogue comparison is done against the *truncated* register ceiling: `max_analogue` is
+    /// 9.9 and the register is a `u32`, so 9.9 × 256 has to become 2534, and comparing the write
+    /// (2534) against the exact product (2534.4) was false at the ceiling — a loop pinned at its
+    /// limit that reported `at_ceiling = false` and kept writing.
     fn at_ceiling(&self, at: Controls) -> bool {
+        let analogue_ceiling =
+            (self.limits.max_analogue * f64::from(self.limits.unity_gain)).floor();
         at.exposure as f64 >= self.limits.hard_lines
-            && at.analogue_gain as f64
-                >= self.limits.max_analogue * f64::from(self.limits.unity_gain)
+            && f64::from(at.analogue_gain) >= analogue_ceiling
     }
 
     /// One step towards the setpoint. `None` inside the deadband, and `None` when the step lands on
@@ -167,7 +191,13 @@ impl Ae {
         self.exposure = budget.min(soft_lines);
         self.analogue = (budget / self.exposure).clamp(1.0, max_analogue);
         self.exposure = (budget / self.analogue).clamp(self.exposure, hard_lines);
-        self.digital = (budget / (self.exposure * self.analogue)).clamp(1.0, MAX_DIGITAL);
+        self.digital = if self.digital_available {
+            (budget / (self.exposure * self.analogue)).clamp(1.0, MAX_DIGITAL)
+        } else {
+            // No ISP gain: the shutter and the analogue gain take the whole step, and the product
+            // they can reach is the sensor's real ceiling.
+            1.0
+        };
 
         let next = self.controls();
         if self.written == Some(next) {
@@ -225,6 +255,19 @@ impl Stop {
     }
 }
 
+/// Where the private vendor ioctl goes, and the gain unit it is written in.
+///
+/// A struct rather than two arguments because the two only make sense together: the node is the
+/// sensor this board exposes, and [`unity_gain`](Self::unity_gain) is how *that* sensor spells 1x
+/// (256 on the IMX219, 64 on the GC2093). Passing one without the other is a gain written 4x wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorPath {
+    /// `/dev/v4l-subdevN`, resolved from the media topology rather than guessed.
+    pub node: String,
+    /// The sensor's [`Exposure::unity_gain`](crate::sensor::Exposure::unity_gain).
+    pub unity_gain: u32,
+}
+
 /// Start the loop. Returns the handle that stops it.
 ///
 /// `device` is the *capture* node rather than the sensor subdev, because rkisp proxies the sensor's
@@ -236,12 +279,16 @@ pub fn spawn(
     limits: Exposure,
     exposure_lines: u32,
     analogue_gain_reg: u32,
+    // The sensor's own device node, when the private vendor ioctl is how this board's exposure
+    // moves (see [`SensorPath`]). `None` keeps the `v4l2-ctl` path, which every other board wants.
+    subdev: Option<SensorPath>,
 ) -> Stop {
     let stop = Stop::default();
     let mine = stop.clone();
 
     tracing::info!(
         %device,
+        subdev = subdev.as_ref().map(|s| s.node.as_str()).unwrap_or("-"),
         target_luma = TARGET_Y,
         shutter_lines = format!("{:.0}/{:.0}", limits.soft_lines, limits.hard_lines),
         analogue_max = limits.max_analogue,
@@ -253,6 +300,12 @@ pub fn spawn(
         .name("auto-exposure".into())
         .spawn(move || {
             let mut ae = Ae::starting_at(limits, exposure_lines, analogue_gain_reg);
+            // The private-ioctl path is the raw-Bayer path, and raw Bayer never meets an ISP: no
+            // digital gain exists to spend, so the shutter and the analogue gain are the whole
+            // budget and the loop must not believe otherwise.
+            if subdev.is_some() {
+                ae = ae.without_digital_gain();
+            }
             let mut proven = false;
             // What this run knows about the ISP's digital gain. See `Digital`.
             let mut digital = Digital::Unknown;
@@ -326,7 +379,7 @@ pub fn spawn(
                 };
                 quiet = 0;
 
-                match write(&device, controls, &mut digital) {
+                match write(&device, subdev.as_ref(), controls, &mut digital) {
                     Err(e) if proven => {
                         // At debug, not an error twice a second for as long as the daemon runs: the
                         // first one already said what is wrong.
@@ -342,7 +395,13 @@ pub fn spawn(
                         );
                     }
                     Ok(()) => {
-                        if worth_reading_back(proven, controls.exposure, exposure_lines) {
+                        // The private ioctl has no read-back: the standard control the driver
+                        // exposes for `exposure` only ever reports what the control framework
+                        // cached (see [`crate::sensorctl`]), so a compare against it would pass and
+                        // prove nothing. The metering line is the evidence instead — the luma it
+                        // prints is the picture this write produced.
+                        let proven_by_ioctl = subdev.is_some();
+                        if !proven_by_ioctl && worth_reading_back(proven, controls.exposure, exposure_lines) {
                             proven = true;
                             match read_exposure(&device) {
                                 Some(landed) if landed == controls.exposure => tracing::info!(
@@ -387,12 +446,29 @@ pub fn spawn(
 /// ISP, and `v4l2-ctl` fails a whole `--set-ctrl` if any name in it is unknown on the node. One
 /// call would mean a board that spells digital gain differently loses its shutter as well, which is
 /// the entire picture rather than the last stop of brightness.
-fn write(device: &str, controls: Controls, digital: &mut Digital) -> std::io::Result<()> {
+fn write(
+    device: &str,
+    subdev: Option<&SensorPath>,
+    controls: Controls,
+    digital: &mut Digital,
+) -> std::io::Result<()> {
     let Controls {
         exposure,
         analogue_gain,
         gain,
     } = controls;
+
+    // **The vendor's own ioctl, when the sensor has one.** Both controls travel in one call,
+    // because that is how `sensor_s_exp_gain` takes them, and there is no ISP digital gain on this
+    // path to steer — the frames never reach the ISP (see [`crate::pipeline`]'s raw-Bayer source).
+    // Marking it `Absent` keeps the digital-gain branch from shelling out every tick for a control
+    // this board does not have.
+    if let Some(sensor) = subdev {
+        crate::sensorctl::set_exp_gain(&sensor.node, exposure, analogue_gain, sensor.unity_gain)?;
+        *digital = Digital::Absent;
+        return Ok(());
+    }
+
     set(
         device,
         &format!("exposure={exposure},analogue_gain={analogue_gain}"),
